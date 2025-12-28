@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/79098cb5-af7a-4343-9469-53d6d220410a" width="29%" alt="RAVELIN Logo by Ali Abdi">
+</p>
+
 **RAVELIN** *(French “[ravelin](https://en.wikipedia.org/wiki/Ravelin)”, an outer defensive fortification)*: **R**ust-powered **A**daptive **V**igilance & **E**nforcement — **L**ayered **I**ntelligent **I**nterceptor **N**ode
 
 A real-time, terminal-based intrusion prevention system (IPS) that monitors system logs, visualizes threats, and actively manages network blocks using `ipset`.
