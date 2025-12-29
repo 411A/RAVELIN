@@ -1,5 +1,4 @@
 // main.rs
-
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::{
@@ -10,13 +9,12 @@ use crossterm::{
 use lazy_static::lazy_static;
 use ratatui::{
     backend::CrosstermBackend,
-    Frame,
-    Terminal,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::Line,
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame, Terminal,
 };
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use regex::Regex;
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Row, Sqlite};
 use std::{
@@ -36,56 +34,69 @@ use tokio::{
 };
 
 // --- CONFIGURATION ---
-
 const DB_URL: &str = "sqlite://ravelin.db?mode=rwc";
 const LEARNING_PERIOD_HOURS: i64 = 12;
 const LOG_CAP: usize = 100;
 const HISTORY_CAP: usize = 500; // per-ip history cap
 
-// --- EMBEDDED INSTALLER SCRIPT ---
-
+// --- EMBEDDED INSTALLER SCRIPT (FIXED FOR DOCKER) ---
 const INSTALLER_SCRIPT: &str = r#"
 #!/bin/bash
 set -e
-echo "[RAVELIN] Self-Check Initiated..."
+
+echo "\[RAVELIN\] Self-Check Initiated..."
+
 if [ -f /etc/debian_version ]; then
   if ! dpkg -s suricata ipset docker.io >/dev/null 2>&1; then
-    echo "[RAVELIN] Installing Dependencies (apt)..."
+    echo "\[RAVELIN\] Installing Dependencies (apt)..."
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y suricata ipset docker.io jq
   fi
 elif [ -f /etc/redhat-release ]; then
   if ! rpm -q suricata ipset docker >/dev/null 2>&1; then
-    echo "[RAVELIN] Installing Dependencies (yum)..."
+    echo "\[RAVELIN\] Installing Dependencies (yum)..."
     yum install -y epel-release
     yum install -y suricata ipset docker jq
   fi
 fi
-echo "[RAVELIN] Configuring Firewall Defense..."
+
+echo "\[RAVELIN\] Configuring Firewall Defense..."
+# Create the hash:ip set
 ipset create sentinel_block hash:ip timeout 0 -exist 2>/dev/null
+
+# 1. Protect the Host (INPUT Chain)
 if ! iptables -C INPUT -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
   iptables -I INPUT -m set --match-set sentinel_block src -j DROP
-  echo "[RAVELIN] IPTables Drop Rule Injected."
+  echo "\[RAVELIN\] IPTables INPUT Drop Rule Injected."
 fi
-echo "[RAVELIN] Tuning Network Stack..."
+
+# 2. Protect Docker Containers (DOCKER-USER Chain)
+# Check if DOCKER-USER chain exists (Docker installed/running)
+if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+  if ! iptables -C DOCKER-USER -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
+    iptables -I DOCKER-USER -m set --match-set sentinel_block src -j DROP
+    echo "\[RAVELIN\] IPTables DOCKER-USER Drop Rule Injected."
+  fi
+fi
+
+echo "\[RAVELIN\] Tuning Network Stack..."
 sysctl -w net.core.netdev_max_backlog=500000 >/dev/null
 sysctl -w net.core.rmem_max=134217728 >/dev/null
-echo "[RAVELIN] System Ready."
+
+echo "\[RAVELIN\] System Ready."
 "#;
 
 // --- REGEX INTELLIGENCE ---
-
 lazy_static! {
     static ref RE_SSH_SUCCESS: Regex =
         Regex::new(r"Accepted (?:publickey|password) for .* from (\d+\.\d+\.\d+\.\d+)").unwrap();
     static ref RE_SSH_FAIL: Regex =
         Regex::new(r"(?:Failed password|Invalid user|Disconnected from authenticating user) .* (\d+\.\d+\.\d+\.\d+)").unwrap();
-    static ref RE_HTTP_ERROR: Regex = Regex::new(r#"(\d+\.\d+\.\d+\.\d+) - - \[.*\] ".*?" [45]\d{2}"#).unwrap();
+    static ref RE_HTTP_ERROR: Regex = Regex::new(r#"(\d+\.\d+\.\d+\.\d+) - - \[.*?\] ".*?" [45]\d{2}"#).unwrap();
     static ref RE_IPV4: Regex = Regex::new(r"(\d+\.\d+\.\d+\.\d+)").unwrap();
 }
 
 // --- DATA STRUCTURES ---
-
 #[derive(Clone, Debug)]
 struct Suspect {
     ip: String,
@@ -114,16 +125,19 @@ struct AppState {
     selected_block_idx: usize,
     active_window: ActiveWindow,
     start_time: DateTime<Utc>,
-    // NEW: scroll offsets and history
+    
+    // scroll offsets and history
     logs_scroll: usize,                      // 0 = show newest
     suspects_scroll: usize,
     blocked_scroll: usize,
     ip_history: HashMap<String, Vec<String>>, // full raw lines per ip (for inspect)
+    
     detail_open: bool,
     detail_ip: Option<String>,
     detail_scroll: usize,
-    detail_scroll_x: usize,                  // NEW: Horizontal scroll for detail
-    search_filter: Option<String>,           // simple filter for suspects
+    detail_scroll_x: usize,                  
+    
+    search_filter: Option<String>,           
 }
 
 #[derive(Clone, PartialEq)]
@@ -139,28 +153,35 @@ enum ActiveWindow {
 }
 
 // --- SYSTEM SETUP ENGINE ---
-
 fn system_self_check() -> Result<()> {
     // Check if critical tools exist
     let has_ipset = Command::new("which").arg("ipset").output()?.status.success();
     let has_suricata = Command::new("which").arg("suricata").output()?.status.success();
+
     if !has_ipset || !has_suricata {
-        println!("⚠️ Dependencies missing. Running embedded installer script (Requires Sudo)...");
+        println!("⚠️ Dependencies missing or updates needed. Running embedded installer script (Requires Sudo)...");
         let setup_path = "/tmp/ravelin_setup.sh";
         fs::write(setup_path, INSTALLER_SCRIPT)?;
         fs::set_permissions(setup_path, Permissions::from_mode(0o755))?;
+
         let status = Command::new("sudo").arg(setup_path).status()?;
         if !status.success() {
             return Err(anyhow::anyhow!("Installer script failed."));
         }
+    } else {
+        // Run installer anyway to ensure IPTables rules are injected even if dependencies exist
+        let setup_path = "/tmp/ravelin_setup.sh";
+        fs::write(setup_path, INSTALLER_SCRIPT)?;
+        fs::set_permissions(setup_path, Permissions::from_mode(0o755))?;
+        let _ = Command::new("sudo").arg(setup_path).status();
     }
     Ok(())
 }
 
 // --- DATABASE LAYER ---
-
 async fn init_db() -> Result<Pool<Sqlite>> {
     let pool = SqlitePoolOptions::new().max_connections(5).connect(DB_URL).await?;
+
     // blocked_ips
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS blocked_ips (
@@ -171,10 +192,12 @@ async fn init_db() -> Result<Pool<Sqlite>> {
     )
     .execute(&pool)
     .await?;
+
     // system_state for persistent values
     sqlx::query("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT)")
         .execute(&pool)
         .await?;
+
     Ok(pool)
 }
 
@@ -183,22 +206,24 @@ async fn get_start_time(pool: &Pool<Sqlite>) -> Result<DateTime<Utc>> {
     let row = sqlx::query("SELECT value FROM system_state WHERE key = 'start_time'")
         .fetch_optional(pool)
         .await?;
+
     if let Some(r) = row {
         let ts_str: String = r.try_get(0)?;
         if let Ok(ts) = DateTime::parse_from_rfc3339(&ts_str) {
             return Ok(ts.with_timezone(&Utc));
         }
     }
+
     let now = Utc::now();
     let _ = sqlx::query("INSERT OR IGNORE INTO system_state (key, value) VALUES ('start_time', ?)")
         .bind(now.to_rfc3339())
         .execute(pool)
         .await?;
+
     Ok(now)
 }
 
 // --- LOG HARVESTER ENGINE ---
-
 async fn harvest_logs(app_state: Arc<Mutex<AppState>>, _pool: Pool<Sqlite>) {
     // 1. Suricata watcher
     {
@@ -270,9 +295,7 @@ async fn harvest_logs(app_state: Arc<Mutex<AppState>>, _pool: Pool<Sqlite>) {
 }
 
 // --- CORE INTELLIGENCE LOGIC ---
-
 async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>) {
-    // Parse everything first (no locking) to avoid holding immutable borrows while later needing mutable borrows.
     let mut suspect_ip: Option<String> = None;
     let mut reason = String::new();
     let mut ips_found: Vec<String> = vec![];
@@ -287,7 +310,6 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
     // parse specific patterns
     if let Some(caps) = RE_SSH_SUCCESS.captures(line) {
         if let Some(ip) = caps.get(1) {
-            // SSH success: immediate whitelist action (we'll perform under lock)
             reason = "SSH Success".to_string();
             ips_found.push(ip.as_str().to_string());
         }
@@ -306,12 +328,9 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
         }
     }
 
-    // Now mutate state with a single lock scope. Keep borrows short and sequential.
     {
         let mut app = state.lock().await;
 
-        // Only store the raw line in HISTORY (for inspect)
-        // attach line to any IPs mentioned (for inspect/history)
         for ip in &ips_found {
             let v = app.ip_history.entry(ip.clone()).or_insert_with(Vec::new);
             v.push(format!("[{}] {}", source, line));
@@ -320,7 +339,6 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
             }
         }
 
-        // If this was an SSH success, whitelist and remove suspects
         if reason == "SSH Success" {
             if let Some(ip_str) = ips_found.last() {
                 app.whitelisted_dynamic.insert(ip_str.clone());
@@ -334,16 +352,13 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
             return;
         }
 
-        // 3. Update state for suspect if present
         if let Some(ip) = suspect_ip {
             if app.whitelisted_dynamic.contains(&ip) {
                 return;
             }
 
-            // Legacy-style simplified log for Top Window
             let log_entry = format!("⚠️ [{}] {} | {}", source, ip, reason);
 
-            // dedupe consecutive identical logs by materializing the last value first (no overlapping borrows)
             let should_push = match app.logs.last() {
                 Some(last) => last != &log_entry,
                 None => true,
@@ -371,35 +386,36 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
                 });
             }
 
-            // --- FIX: SORT BY SCORE (Descending) ---
             app.suspects.sort_by(|a, b| b.score.cmp(&a.score));
 
-            // keep suspects list trimmed (avoid runaway)
             let suspect_len = app.suspects.len();
             if suspect_len > 2000 {
-                // Drain from the END (low scores) to preserve top scorers at the start
                 app.suspects.drain(2000..);
             }
         }
-    } // lock released here
+    }
 }
 
 // --- ACTIONS ---
-
 async fn block_ip(ip: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>>) -> Result<()> {
     // Ensure ipset exists (installer should create it), then add IP
+    // Note: We don't need to re-run iptables -I here because the rule points to the set.
+    // As long as the IP is in the set, the existing iptables rule will drop it.
     let _ = Command::new("sudo")
         .args(["ipset", "create", "sentinel_block", "hash:ip", "timeout", "0", "-exist"])
         .output();
+        
     Command::new("sudo")
         .args(["ipset", "add", "sentinel_block", &ip, "-exist"])
         .output()?;
+
     sqlx::query("INSERT OR REPLACE INTO blocked_ips (ip, blocked_at, reason) VALUES (?, ?, ?)")
         .bind(&ip)
         .bind(Utc::now())
         .bind("Manual Block")
         .execute(pool)
         .await?;
+
     let mut app = state.lock().await;
     app.suspects.retain(|s| s.ip != ip);
     app.blocked.push(BlockedIp {
@@ -407,24 +423,26 @@ async fn block_ip(ip: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>>)
         blocked_at: Utc::now(),
         reason: "Manual Block".to_string(),
     });
+
     Ok(())
 }
 
 async fn unblock_ip(ip: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>>) -> Result<()> {
     Command::new("sudo").args(["ipset", "del", "sentinel_block", &ip]).output()?;
+
     sqlx::query("DELETE FROM blocked_ips WHERE ip = ?")
         .bind(&ip)
         .execute(pool)
         .await?;
+
     let mut app = state.lock().await;
     app.blocked.retain(|b| b.ip != ip);
+
     Ok(())
 }
 
 // --- UI ---
-
 fn ui_render(f: &mut Frame, app: &AppState) {
-    // Top / Middle / Bottom layout
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -439,11 +457,12 @@ fn ui_render(f: &mut Frame, app: &AppState) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
-    // --- LOGS (top) with scroll ---
+    // --- LOGS ---
     let log_visible = chunks[0].height.saturating_sub(2) as usize;
     let total_logs = app.logs.len();
     let end = total_logs.saturating_sub(app.logs_scroll);
     let start = if end > log_visible { end - log_visible } else { 0 };
+
     let visible_logs = app
         .logs
         .get(start..end)
@@ -457,7 +476,7 @@ fn ui_render(f: &mut Frame, app: &AppState) {
     let logs_widget = List::new(visible_logs).block(Block::default().borders(Borders::ALL).title(logs_title));
     f.render_widget(logs_widget, chunks[0]);
 
-    // If detail_open -> show detail view in middle area (consumes both mid panes)
+    // --- MIDDLE AREA ---
     if app.detail_open {
         let detail_rect = chunks[1];
         let mut lines: Vec<ListItem> = vec![];
@@ -465,11 +484,11 @@ fn ui_render(f: &mut Frame, app: &AppState) {
             let history = app.ip_history.get(ip).map(|v| v.as_slice()).unwrap_or(&[]);
             let total = history.len();
             let visible = detail_rect.height.saturating_sub(2) as usize;
-            // Detail Scrolling
+
             let start = app.detail_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
+
             for line in &history[start..end] {
-                // --- FIX: Horizontal Scrolling ---
                 let raw_str = line.as_str();
                 let skip_amount = app.detail_scroll_x.min(raw_str.len());
                 let content = &raw_str[skip_amount..];
@@ -483,11 +502,10 @@ fn ui_render(f: &mut Frame, app: &AppState) {
             f.render_widget(empty, detail_rect);
         }
     } else {
-        // Suspects (mid left) - apply filter + scrolling + selection highlight
+        // Suspects
         let left = mid_chunks[0];
         let mid_visible = left.height.saturating_sub(2) as usize;
 
-        // build filtered view indices
         let filtered: Vec<&Suspect> = if let Some(filter) = &app.search_filter {
             let f_low = filter.to_lowercase();
             app.suspects
@@ -501,8 +519,6 @@ fn ui_render(f: &mut Frame, app: &AppState) {
         };
 
         let total_filtered = filtered.len();
-
-        // --- FIX: Ensure scroll doesn't exceed total ---
         let start = app.suspects_scroll.min(total_filtered);
         let end = usize::min(start + mid_visible, total_filtered);
 
@@ -519,11 +535,10 @@ fn ui_render(f: &mut Frame, app: &AppState) {
                 ListItem::new(format!("{} | [{}] {} | Score: {} | {}", global_idx + 1, s.source_type, s.ip, s.score, s.reason)).style(style)
             })
             .collect();
-
         let suspects_widget = List::new(suspects).block(Block::default().borders(Borders::ALL).title(" 🕵️ SUSPECTS (Enter: Block) "));
         f.render_widget(suspects_widget, left);
 
-        // Blocked (mid right)
+        // Blocked
         let right = mid_chunks[1];
         let right_visible = right.height.saturating_sub(2) as usize;
         let total_blocked = app.blocked.len();
@@ -543,12 +558,11 @@ fn ui_render(f: &mut Frame, app: &AppState) {
                 ListItem::new(format!("{} | {} | {} | Since: {}", global_idx + 1, b.ip, b.reason, b.blocked_at.format("%Y-%m-%d %H:%M:%S"))).style(style)
             })
             .collect();
-
         let blocked_widget = List::new(blocked).block(Block::default().borders(Borders::ALL).title(" 🚫 BLOCKED (Enter: Unblock) "));
         f.render_widget(blocked_widget, right);
     }
 
-    // Bottom: status / command
+    // Bottom
     let time_alive = Utc::now().signed_duration_since(app.start_time).num_hours();
     let mode_text = if time_alive < LEARNING_PERIOD_HOURS {
         format!("🛡️ LEARNING MODE ({}h remaining) - No Auto-Block", LEARNING_PERIOD_HOURS - time_alive)
@@ -559,7 +573,6 @@ fn ui_render(f: &mut Frame, app: &AppState) {
     let input_text = if app.input_mode == InputMode::Command {
         app.input_buffer.clone()
     } else {
-        // add extra key hints for tmux-friendly navigation
         format!("{} | [TAB] Switch Lists | [j/k] Move | [PgUp/PgDn] Scroll | [i] Inspect | [/] Search | [Q] Quit | [:] Cmd Mode", mode_text)
     };
 
@@ -569,30 +582,23 @@ fn ui_render(f: &mut Frame, app: &AppState) {
     f.render_widget(cmd_widget, chunks[2]);
 }
 
-// --- RUN UI (kept as separate function) ---
-
+// --- RUN UI ---
 async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sqlite>, state: Arc<Mutex<AppState>>) -> Result<()> {
     loop {
-        // 1. RENDER PHASE
+        // 1. RENDER
         {
             let app = state.lock().await;
             terminal.draw(|f| ui_render(f, &app))?;
         }
 
-        // 2. EVENT PHASE
+        // 2. EVENT
         if event::poll(time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                // plan async actions outside lock
                 let mut should_block_ip: Option<String> = None;
                 let mut should_unblock_ip: Option<String> = None;
 
                 {
                     let mut app = state.lock().await;
-
-                    // --- CALCULATION FOR SCROLLING ---
-                    // The middle section (lists) is 60% of terminal height.
-                    // We calculate visible rows to handle scrolling bounds correctly.
-                    // (Height * 0.6) - 2 for borders.
                     let term_height = terminal.size()?.height;
                     let list_visible_height = (term_height as u16 * 60 / 100).saturating_sub(2) as usize;
 
@@ -612,14 +618,13 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
                             KeyCode::Tab => {
                                 app.active_window = if app.active_window == ActiveWindow::Suspects { ActiveWindow::Blocked } else { ActiveWindow::Suspects };
                             }
-                            // --- NAVIGATION DOWN ---
+                            // NAV DOWN
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if app.detail_open {
                                     app.detail_scroll = app.detail_scroll.saturating_add(1);
                                 } else if app.active_window == ActiveWindow::Suspects {
                                     if app.selected_suspect_idx + 1 < app.suspects.len() {
                                         app.selected_suspect_idx += 1;
-                                        // Scroll logic: If cursor goes below visible area
                                         if app.selected_suspect_idx >= app.suspects_scroll + list_visible_height {
                                             app.suspects_scroll = app.selected_suspect_idx + 1 - list_visible_height;
                                         }
@@ -633,14 +638,13 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
                                     }
                                 }
                             }
-                            // --- NAVIGATION UP ---
+                            // NAV UP
                             KeyCode::Up | KeyCode::Char('k') => {
                                 if app.detail_open {
                                     app.detail_scroll = app.detail_scroll.saturating_sub(1);
                                 } else if app.active_window == ActiveWindow::Suspects {
                                     if app.selected_suspect_idx > 0 {
                                         app.selected_suspect_idx -= 1;
-                                        // Scroll logic: If cursor goes above visible area
                                         if app.selected_suspect_idx < app.suspects_scroll {
                                             app.suspects_scroll = app.selected_suspect_idx;
                                         }
@@ -654,7 +658,7 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
                                     }
                                 }
                             }
-                            // --- HORIZONTAL SCROLLING ---
+                            // HORZ
                             KeyCode::Left | KeyCode::Char('h') => {
                                 if app.detail_open {
                                     app.detail_scroll_x = app.detail_scroll_x.saturating_sub(5);
@@ -681,7 +685,6 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
                             }
                             KeyCode::Enter => {
                                 if app.detail_open {
-                                    // noop
                                 } else if app.active_window == ActiveWindow::Suspects && !app.suspects.is_empty() {
                                     let ip = app.suspects[app.selected_suspect_idx].ip.clone();
                                     should_block_ip = Some(ip);
@@ -749,13 +752,11 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
                             _ => {}
                         }
                     }
-                } // lock dropped here
+                }
 
-                // 3. ASYNC ACTION PHASE (Outside the lock)
                 if let Some(ip) = should_block_ip {
                     let _ = block_ip(ip, &pool, &state).await;
                 }
-
                 if let Some(ip) = should_unblock_ip {
                     let _ = unblock_ip(ip, &pool, &state).await;
                 }
@@ -765,10 +766,8 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
 }
 
 // --- ENTRY POINT ---
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 0. Safety note to user
     println!("Starting Ravelin TUI — ensuring dependencies & DB...");
 
     // 1. SELF-DEPLOYMENT PHASE
@@ -787,6 +786,17 @@ async fn main() -> Result<()> {
             .fetch_all(&pool)
             .await
             .unwrap_or_default();
+
+    // FIX: RESTORE FIREWALL STATE
+    // This loops through the DB entries and re-applies them to IPSet so reboot doesn't clear them.
+    if !initial_blocked.is_empty() {
+        println!("Restoring firewall rules for {} blocked IPs...", initial_blocked.len());
+        for b in &initial_blocked {
+            let _ = Command::new("sudo")
+                .args(["ipset", "add", "sentinel_block", &b.ip, "-exist"])
+                .output();
+        }
+    }
 
     // 3. INIT TERMINAL (TUI)
     enable_raw_mode()?;
@@ -814,14 +824,14 @@ async fn main() -> Result<()> {
         detail_open: false,
         detail_ip: None,
         detail_scroll: 0,
-        detail_scroll_x: 0, // NEW: Init horizontal scroll
+        detail_scroll_x: 0,
         search_filter: None,
     }));
 
     // 5. START HARVESTERS
     harvest_logs(app_state.clone(), pool.clone()).await;
 
-    // 6. RUN UI LOOPY (separate function)
+    // 6. RUN UI LOOPY
     let res = run_ui(&mut terminal, pool.clone(), app_state.clone()).await;
 
     // 7. CLEANUP TUI
