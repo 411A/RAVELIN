@@ -39,7 +39,7 @@ const LEARNING_PERIOD_HOURS: i64 = 12;
 const LOG_CAP: usize = 100;
 const HISTORY_CAP: usize = 500; // per-ip history cap
 
-// --- EMBEDDED INSTALLER SCRIPT (FIXED FOR DOCKER) ---
+// --- EMBEDDED INSTALLER SCRIPT ---
 const INSTALLER_SCRIPT: &str = r#"
 #!/bin/bash
 set -e
@@ -47,16 +47,16 @@ set -e
 echo "\[RAVELIN\] Self-Check Initiated..."
 
 if [ -f /etc/debian_version ]; then
-  if ! dpkg -s suricata ipset docker.io >/dev/null 2>&1; then
+  if ! dpkg -s suricata ipset jq >/dev/null 2>&1; then
     echo "\[RAVELIN\] Installing Dependencies (apt)..."
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y suricata ipset docker.io jq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y suricata ipset jq
   fi
 elif [ -f /etc/redhat-release ]; then
-  if ! rpm -q suricata ipset docker >/dev/null 2>&1; then
+  if ! rpm -q suricata ipset jq >/dev/null 2>&1; then
     echo "\[RAVELIN\] Installing Dependencies (yum)..."
     yum install -y epel-release
-    yum install -y suricata ipset docker jq
+    yum install -y suricata ipset jq
   fi
 fi
 
@@ -106,6 +106,74 @@ struct Suspect {
     source_type: String,
 }
 
+// --- LOCAL IP DETECTION ---
+fn get_local_ips() -> HashSet<String> {
+    let mut local_ips = HashSet::new();
+    
+    // Add localhost
+    local_ips.insert("127.0.0.1".to_string());
+    local_ips.insert("::1".to_string());
+    
+    // Try to get all interface IPs via hostname -I command
+    if let Ok(output) = Command::new("hostname").arg("-I").output() {
+        let ips_str = String::from_utf8_lossy(&output.stdout);
+        for ip in ips_str.split_whitespace() {
+            if !ip.is_empty() && ip.contains('.') {
+                local_ips.insert(ip.to_string());
+            }
+        }
+    }
+    
+    // Fallback: try ip addr show
+    if local_ips.len() <= 1 {
+        if let Ok(output) = Command::new("ip").args(["addr", "show"]).output() {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            for line in output_str.lines() {
+                if line.contains("inet ") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let ip_part = parts[1].split('/').next().unwrap_or("");
+                        if !ip_part.is_empty() && ip_part != "127.0.0.1" {
+                            local_ips.insert(ip_part.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Get public IP using multiple services with fallback
+    // List of reliable public IP services
+    let ip_services = [
+        "ifconfig.me",
+        "icanhazip.com",
+        "checkip.amazonaws.com",
+        "ipecho.net/plain",
+        "ident.me",
+        "ipinfo.io/ip",
+        "api.ipify.org",
+    ];
+    
+    for service in &ip_services {
+        let _ = Command::new("timeout")
+            .args(["3", "curl", "-s", service])
+            .output()
+            .map(|output| {
+                let public_ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !public_ip.is_empty() && public_ip.contains('.') {
+                    local_ips.insert(public_ip);
+                }
+            });
+        
+        // If we got a public IP, we can stop trying
+        if local_ips.len() > 2 {
+            break;
+        }
+    }
+    
+    local_ips
+}
+
 #[derive(Clone, Debug, sqlx::FromRow)]
 struct BlockedIp {
     ip: String,
@@ -119,6 +187,7 @@ struct AppState {
     suspects: Vec<Suspect>,                  // Mid-Left Window
     blocked: Vec<BlockedIp>,                 // Mid-Right Window
     whitelisted_dynamic: HashSet<String>,    // Dynamic Friendly IPs
+    local_ips: HashSet<String>,              // Local server IPs (to exclude from suspects)
     input_buffer: String,                    // Bottom Window (command mode)
     input_mode: InputMode,
     selected_suspect_idx: usize,
@@ -135,9 +204,9 @@ struct AppState {
     detail_open: bool,
     detail_ip: Option<String>,
     detail_scroll: usize,
-    detail_scroll_x: usize,                  
+    detail_scroll_x: usize,
     
-    search_filter: Option<String>,           
+    search_filter: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -353,6 +422,11 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
         }
 
         if let Some(ip) = suspect_ip {
+            // Skip local/server IPs
+            if app.local_ips.contains(&ip) {
+                return;
+            }
+            
             if app.whitelisted_dynamic.contains(&ip) {
                 return;
             }
@@ -806,11 +880,13 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // 4. APP STATE
+    let local_ips = get_local_ips();
     let app_state = Arc::new(Mutex::new(AppState {
         logs: vec![],
         suspects: vec![],
         blocked: initial_blocked,
         whitelisted_dynamic: HashSet::new(),
+        local_ips,
         input_buffer: String::new(),
         input_mode: InputMode::Normal,
         selected_suspect_idx: 0,
