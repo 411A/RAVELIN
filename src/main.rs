@@ -39,35 +39,40 @@ const LEARNING_PERIOD_HOURS: i64 = 12;
 const LOG_CAP: usize = 100;
 const HISTORY_CAP: usize = 500; // per-ip history cap
 
+// Auto-Block Configuration
+// Note: These thresholds apply to suspicious events (SSH failures, HTTP errors, IDS alerts), not all requests
+const AUTO_BLOCK_SUSPICIOUS_EVENTS_THRESHOLD: u32 = 200;  // Minimum suspicious events before checking for auto-block
+const AUTO_BLOCK_FAILURE_PERCENT: u32 = 95;       // Percentage of failed suspicious events required (95% = 95)
+
 // --- EMBEDDED INSTALLER SCRIPT ---
 const INSTALLER_SCRIPT: &str = r#"
 #!/bin/bash
 set -e
 
-echo "\[RAVELIN\] Self-Check Initiated..."
+echo "[RAVELIN] Self-Check Initiated..."
 
 if [ -f /etc/debian_version ]; then
   if ! dpkg -s suricata ipset jq >/dev/null 2>&1; then
-    echo "\[RAVELIN\] Installing Dependencies (apt)..."
+    echo "[RAVELIN] Installing Dependencies (apt)..."
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y suricata ipset jq
   fi
 elif [ -f /etc/redhat-release ]; then
   if ! rpm -q suricata ipset jq >/dev/null 2>&1; then
-    echo "\[RAVELIN\] Installing Dependencies (yum)..."
+    echo "[RAVELIN] Installing Dependencies (yum)..."
     yum install -y epel-release
     yum install -y suricata ipset jq
   fi
 fi
 
-echo "\[RAVELIN\] Configuring Firewall Defense..."
+echo "[RAVELIN] Configuring Firewall Defense..."
 # Create the hash:ip set
 ipset create sentinel_block hash:ip timeout 0 -exist 2>/dev/null
 
 # 1. Protect the Host (INPUT Chain)
 if ! iptables -C INPUT -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
   iptables -I INPUT -m set --match-set sentinel_block src -j DROP
-  echo "\[RAVELIN\] IPTables INPUT Drop Rule Injected."
+  echo "[RAVELIN] IPTables INPUT Drop Rule Injected."
 fi
 
 # 2. Protect Docker Containers (DOCKER-USER Chain)
@@ -75,25 +80,32 @@ fi
 if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
   if ! iptables -C DOCKER-USER -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
     iptables -I DOCKER-USER -m set --match-set sentinel_block src -j DROP
-    echo "\[RAVELIN\] IPTables DOCKER-USER Drop Rule Injected."
+    echo "[RAVELIN] IPTables DOCKER-USER Drop Rule Injected."
   fi
 fi
 
-echo "\[RAVELIN\] Tuning Network Stack..."
+echo "[RAVELIN] Tuning Network Stack..."
 sysctl -w net.core.netdev_max_backlog=500000 >/dev/null
 sysctl -w net.core.rmem_max=134217728 >/dev/null
 
-echo "\[RAVELIN\] System Ready."
+echo "[RAVELIN] System Ready."
 "#;
 
 // --- REGEX INTELLIGENCE ---
 lazy_static! {
-    static ref RE_SSH_SUCCESS: Regex =
-        Regex::new(r"Accepted (?:publickey|password) for .* from (\d+\.\d+\.\d+\.\d+)").unwrap();
-    static ref RE_SSH_FAIL: Regex =
-        Regex::new(r"(?:Failed password|Invalid user|Disconnected from authenticating user) .* (\d+\.\d+\.\d+\.\d+)").unwrap();
-    static ref RE_HTTP_ERROR: Regex = Regex::new(r#"(\d+\.\d+\.\d+\.\d+) - - \[.*?\] ".*?" [45]\d{2}"#).unwrap();
-    static ref RE_IPV4: Regex = Regex::new(r"(\d+\.\d+\.\d+\.\d+)").unwrap();
+    static ref RE_SSH_SUCCESS: Regex = Regex::new(
+        r"Accepted (?:publickey|password) for .* from (\d+\.\d+\.\d+\.\d+)"
+    ).unwrap();
+    static ref RE_SSH_FAIL: Regex = Regex::new(
+        // Added "Connection closed" and "Received disconnect" to catch early scanners
+        r"(?i)(?:Failed password|Invalid user|authentication failure|Disconnected from authenticating user|Connection closed by|Received disconnect from).*?(\d+\.\d+\.\d+\.\d+)"
+    ).unwrap();
+    static ref RE_HTTP_ERROR: Regex = Regex::new(
+        r#"(\d+\.\d+\.\d+\.\d+) - - \[.*?\] ".*?" [45]\d{2}"#
+    ).unwrap();
+    static ref RE_IPV4: Regex = Regex::new(
+        r"(\d+\.\d+\.\d+\.\d+)"
+    ).unwrap();
 }
 
 // --- DATA STRUCTURES ---
@@ -104,6 +116,13 @@ struct Suspect {
     score: u32,
     last_seen: DateTime<Utc>,
     source_type: String,
+}
+
+#[derive(Clone, Debug)]
+struct RequestStats {
+    suspicious_events_total: u32,  // Only counts events matched by Regex (SSH Fail, IDS, etc)
+    confirmed_failures: u32,       // Counts specific "high confidence" failure keywords
+    last_updated: DateTime<Utc>,
 }
 
 // --- LOCAL IP DETECTION ---
@@ -207,6 +226,7 @@ struct AppState {
     detail_scroll_x: usize,
     
     search_filter: Option<String>,
+    request_stats: HashMap<String, RequestStats>, // Track requests per IP for auto-blocking
 }
 
 #[derive(Clone, PartialEq)]
@@ -383,7 +403,6 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
             ips_found.push(ip.as_str().to_string());
         }
     }
-
     if let Some(caps) = RE_SSH_FAIL.captures(line) {
         suspect_ip = Some(caps.get(1).unwrap().as_str().to_string());
         reason = "SSH Auth Failure".to_string();
@@ -431,8 +450,26 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
                 return;
             }
 
-            let log_entry = format!("⚠️ [{}] {} | {}", source, ip, reason);
+            // If we already blocked them, don't re-add them to suspects!
+            if app.blocked.iter().any(|b| b.ip == ip) {
+                return;
+            }
 
+            // --- SMART WEIGHTING SYSTEM ---
+            // SSH is high risk, give it 20 points. (10 attempts = 200 score = BLOCK)
+            // IDS is medium risk, give it 10 points. (20 alerts = 200 score = BLOCK)
+            // HTTP is low risk, give it 1 point. (200 errors = 200 score = BLOCK)
+            let weight: u32 = if reason.contains("SSH") {
+                20 
+            } else if reason.contains("IDS") || source == "Suricata" {
+                10
+            } else {
+                1
+            };
+
+            let log_entry = format!("⚠️ [{}] {} | {} (Severity: {})", source, ip, reason, weight);
+            
+            // Log de-duplication
             let should_push = match app.logs.last() {
                 Some(last) => last != &log_entry,
                 None => true,
@@ -445,8 +482,32 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
                 }
             }
 
+            // Track request statistics for auto-blocking
+            let stats = app.request_stats.entry(ip.clone()).or_insert_with(|| RequestStats {
+                suspicious_events_total: 0,
+                confirmed_failures: 0,
+                last_updated: Utc::now(),
+            });
+
+            // Add WEIGHT instead of just 1
+            stats.suspicious_events_total += weight;
+            stats.last_updated = Utc::now();
+            
+            // Determine if this is a "High Confidence" failure
+            let is_failure = reason.contains("Failure") 
+                || reason.contains("Fail") 
+                || reason.contains("Error") 
+                || reason.contains("Invalid")
+                || reason.contains("Alert");
+                
+            if is_failure {
+                // If it failed, it failed with high severity
+                stats.confirmed_failures += weight;
+            }
+
+            // Update UI Suspect List
             if let Some(existing) = app.suspects.iter_mut().find(|s| s.ip == ip) {
-                existing.score += 1;
+                existing.score += weight; // Update Score by weight
                 existing.last_seen = Utc::now();
                 existing.reason = reason.clone();
                 existing.source_type = source.to_string();
@@ -454,14 +515,13 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
                 app.suspects.push(Suspect {
                     ip: ip.clone(),
                     reason: reason.clone(),
-                    score: 1,
+                    score: weight, // Start with weight
                     last_seen: Utc::now(),
                     source_type: source.to_string(),
                 });
             }
 
             app.suspects.sort_by(|a, b| b.score.cmp(&a.score));
-
             let suspect_len = app.suspects.len();
             if suspect_len > 2000 {
                 app.suspects.drain(2000..);
@@ -471,7 +531,7 @@ async fn process_log_line(line: &str, source: &str, state: &Arc<Mutex<AppState>>
 }
 
 // --- ACTIONS ---
-async fn block_ip(ip: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>>) -> Result<()> {
+async fn block_ip(ip: String, display_reason: String, db_reason: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>>) -> Result<()> {
     // Ensure ipset exists (installer should create it), then add IP
     // Note: We don't need to re-run iptables -I here because the rule points to the set.
     // As long as the IP is in the set, the existing iptables rule will drop it.
@@ -486,16 +546,17 @@ async fn block_ip(ip: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>>)
     sqlx::query("INSERT OR REPLACE INTO blocked_ips (ip, blocked_at, reason) VALUES (?, ?, ?)")
         .bind(&ip)
         .bind(Utc::now())
-        .bind("Manual Block")
+        .bind(&db_reason)
         .execute(pool)
         .await?;
 
     let mut app = state.lock().await;
     app.suspects.retain(|s| s.ip != ip);
+    app.request_stats.remove(&ip); // Clean up request stats for blocked IP
     app.blocked.push(BlockedIp {
         ip: ip.clone(),
         blocked_at: Utc::now(),
-        reason: "Manual Block".to_string(),
+        reason: display_reason.clone(),
     });
 
     Ok(())
@@ -513,6 +574,69 @@ async fn unblock_ip(ip: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>
     app.blocked.retain(|b| b.ip != ip);
 
     Ok(())
+}
+
+/// Normalizes the reason text for display purposes.
+/// Extracts "Auto Block" from detailed reason strings like "Auto Block: >200 suspicious events with >95% failure rate".
+fn normalize_reason_for_display(reason: &str) -> String {
+    if reason.starts_with("Auto Block:") {
+        "Auto Block".to_string()
+    } else {
+        reason.to_string()
+    }
+}
+
+/// Checks if an IP should be auto-blocked based on request rate and failure percentage.
+/// Returns Ok(true) if the IP was blocked, Ok(false) if it shouldn't be blocked, or Err if blocking failed.
+async fn check_auto_block(ip: String, pool: &Pool<Sqlite>, state: &Arc<Mutex<AppState>>) -> Result<bool> {
+    let should_block = {
+        let app = state.lock().await;
+        
+        // 1. Safety Whitelist (Smart System)
+        if app.whitelisted_dynamic.contains(&ip) {
+            return Ok(false);
+        }
+        
+        // 2. Already Blocked?
+        if app.blocked.iter().any(|b| b.ip == ip) {
+            return Ok(false);
+        }
+        
+        // 3. Double Verification Logic
+        if let Some(stats) = app.request_stats.get(&ip) {
+            // CHECK A: Quantity (Do we have enough data?)
+            if stats.suspicious_events_total >= AUTO_BLOCK_SUSPICIOUS_EVENTS_THRESHOLD {
+                
+                // CHECK B: Quality (Is the "Failure Percentage" high enough?)
+                // This uses your AUTO_BLOCK_FAILURE_PERCENT config!
+                let failure_percent = if stats.suspicious_events_total > 0 {
+                    (stats.confirmed_failures * 100) / stats.suspicious_events_total
+                } else {
+                    0
+                };
+
+                // Only block if BOTH quantity and quality thresholds are met
+                failure_percent >= AUTO_BLOCK_FAILURE_PERCENT
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    
+    if should_block {
+        let display_reason = "Auto Block".to_string();
+        let db_reason = format!(
+            "Auto Block: >{} suspicious events with >{}% failure rate", 
+            AUTO_BLOCK_SUSPICIOUS_EVENTS_THRESHOLD, 
+            AUTO_BLOCK_FAILURE_PERCENT
+        );
+        block_ip(ip, display_reason, db_reason, pool, state).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 // --- UI ---
@@ -658,7 +782,59 @@ fn ui_render(f: &mut Frame, app: &AppState) {
 
 // --- RUN UI ---
 async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sqlite>, state: Arc<Mutex<AppState>>) -> Result<()> {
+    // Spawn auto-block task in the background (doesn't block UI)
+    {
+        let pool_clone = pool.clone();
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(time::Duration::from_secs(5));
+            loop {
+                interval.tick().await; // Wait for next 5-second interval
+                
+                let app = state_clone.lock().await;
+                let time_alive = Utc::now().signed_duration_since(app.start_time).num_hours();
+                drop(app);
+                
+                // Only auto-block after learning period
+                if time_alive >= LEARNING_PERIOD_HOURS {
+                    let mut ips_to_check: Vec<String> = Vec::new();
+                    {
+                        let app = state_clone.lock().await;
+                        for (ip, stats) in &app.request_stats {
+                            // Only check IPs that have reached the threshold
+                            if stats.suspicious_events_total >= AUTO_BLOCK_SUSPICIOUS_EVENTS_THRESHOLD {
+                                ips_to_check.push(ip.clone());
+                            }
+                        }
+                    }
+                    
+                    for ip in ips_to_check {
+                        match check_auto_block(ip.clone(), &pool_clone, &state_clone).await {
+                            Ok(blocked) => {
+                                if blocked {
+                                    let mut app = state_clone.lock().await;
+                                    app.logs.push(format!("🔒 [AUTO-BLOCK] {} blocked automatically", ip));
+                                    if app.logs.len() > LOG_CAP {
+                                        app.logs.remove(0);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let mut app = state_clone.lock().await;
+                                app.logs.push(format!("❌ [AUTO-BLOCK ERROR] Failed to block {}: {}", ip, e));
+                                if app.logs.len() > LOG_CAP {
+                                    app.logs.remove(0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
     loop {
+        
         // 1. RENDER
         {
             let app = state.lock().await;
@@ -666,7 +842,7 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
         }
 
         // 2. EVENT
-        if event::poll(time::Duration::from_millis(100))? {
+        if event::poll(time::Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 let mut should_block_ip: Option<String> = None;
                 let mut should_unblock_ip: Option<String> = None;
@@ -829,7 +1005,9 @@ async fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, pool: Pool<Sq
                 }
 
                 if let Some(ip) = should_block_ip {
-                    let _ = block_ip(ip, &pool, &state).await;
+                    let display_reason = "Manual Block".to_string();
+                    let db_reason = "Manual Block".to_string();
+                    let _ = block_ip(ip, display_reason, db_reason, &pool, &state).await;
                 }
                 if let Some(ip) = should_unblock_ip {
                     let _ = unblock_ip(ip, &pool, &state).await;
@@ -855,11 +1033,21 @@ async fn main() -> Result<()> {
     let start_time = get_start_time(&pool).await?;
 
     // load persisted blocked list
-    let initial_blocked: Vec<BlockedIp> =
-        sqlx::query_as::<_, BlockedIp>("SELECT ip, blocked_at, reason FROM blocked_ips")
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
+    let initial_blocked: Vec<BlockedIp> = {
+        let db_entries: Vec<BlockedIp> =
+            sqlx::query_as::<_, BlockedIp>("SELECT ip, blocked_at, reason FROM blocked_ips")
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+        
+        // Normalize reasons for display
+        db_entries.into_iter()
+            .map(|mut entry| {
+                entry.reason = normalize_reason_for_display(&entry.reason);
+                entry
+            })
+            .collect()
+    };
 
     // FIX: RESTORE FIREWALL STATE
     // This loops through the DB entries and re-applies them to IPSet so reboot doesn't clear them.
@@ -902,6 +1090,7 @@ async fn main() -> Result<()> {
         detail_scroll: 0,
         detail_scroll_x: 0,
         search_filter: None,
+        request_stats: HashMap::new(),
     }));
 
     // 5. START HARVESTERS
