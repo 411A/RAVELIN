@@ -15,7 +15,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     actions,
-    constants::{EVENT_POLL_INTERVAL_MS, LEARNING_PERIOD_HOURS, MANUAL_BLOCK_REASON},
+    constants::{
+        BACKBONE_SERVICE_NAME, EVENT_POLL_INTERVAL_MS, LEARNING_PERIOD_HOURS, MANUAL_BLOCK_REASON,
+        MAX_COMMAND_BUFFER_CHARS,
+    },
     models::{ActiveWindow, AppState, InputMode, Suspect},
     network::normalize_ipv4,
 };
@@ -223,7 +226,8 @@ fn render_command_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         app.input_buffer.clone()
     } else {
         format!(
-            "{mode_text} | [TAB] Switch Lists | [j/k] Move | [PgUp/PgDn] Scroll | [i] Inspect | [/] Search | [Q] Quit | [:] Cmd Mode"
+            "{} | {mode_text} | [TAB] Lists | [j/k] Move | [i] Inspect | [/] Search | [Esc/Q] Exit TUI | systemctl stop {BACKBONE_SERVICE_NAME} stops protection",
+            app.runtime_mode.label()
         )
     };
 
@@ -250,6 +254,10 @@ fn suspect_list_item(index: usize, suspect: &Suspect) -> ListItem<'_> {
 
 fn handle_key_code(code: KeyCode, app: &mut AppState, list_visible_height: usize) -> UiAction {
     clamp_ui_selection(app);
+    if code == KeyCode::Esc {
+        return UiAction::Quit;
+    }
+
     match app.input_mode {
         InputMode::Normal => handle_normal_key(code, app, list_visible_height),
         InputMode::Command => handle_command_key(code, app),
@@ -312,10 +320,6 @@ fn handle_normal_key(code: KeyCode, app: &mut AppState, list_visible_height: usi
             inspect_selected_suspect(app);
             UiAction::None
         }
-        KeyCode::Esc => {
-            close_detail(app);
-            UiAction::None
-        }
         _ => UiAction::None,
     }
 }
@@ -323,12 +327,10 @@ fn handle_normal_key(code: KeyCode, app: &mut AppState, list_visible_height: usi
 fn handle_command_key(code: KeyCode, app: &mut AppState) -> UiAction {
     match code {
         KeyCode::Enter => run_command_buffer(app),
-        KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
-            app.input_buffer.clear();
-            UiAction::None
-        }
         KeyCode::Char(ch) => {
+            if app.input_buffer.chars().count() >= MAX_COMMAND_BUFFER_CHARS {
+                return UiAction::None;
+            }
             app.input_buffer.push(ch);
             UiAction::None
         }
@@ -359,7 +361,7 @@ fn run_command_buffer(app: &mut AppState) -> UiAction {
     {
         app.whitelisted_dynamic.insert(ip.clone());
         app.suspects.retain(|suspect| suspect.ip != ip);
-        app.push_log(format!("🟢 [WHITELISTED] {ip}"));
+        app.push_log(&format!("🟢 [WHITELISTED] {ip}"));
         app.clamp_selected_indexes();
         return UiAction::None;
     }
@@ -375,7 +377,7 @@ fn run_command_buffer(app: &mut AppState) -> UiAction {
     } else if let Some(pattern) = command.strip_prefix('/') {
         set_search_filter(app, pattern.trim());
     } else if !command.is_empty() {
-        app.push_log(format!("Unknown: {command}"));
+        app.push_log(&format!("Unknown: {command}"));
     }
 
     UiAction::None
@@ -462,15 +464,6 @@ fn inspect_selected_suspect(app: &mut AppState) {
     if let Some(ip) = selected_suspect_ip(app) {
         app.detail_open = true;
         app.detail_ip = Some(ip);
-        app.detail_scroll = 0;
-        app.detail_scroll_x = 0;
-    }
-}
-
-fn close_detail(app: &mut AppState) {
-    if app.detail_open {
-        app.detail_open = false;
-        app.detail_ip = None;
         app.detail_scroll = 0;
         app.detail_scroll_x = 0;
     }

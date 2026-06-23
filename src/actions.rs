@@ -48,7 +48,7 @@ pub async fn block_ip(
         });
     }
 
-    app.push_log(format!("🚫 [BLOCKED] {ip} | {reason}"));
+    app.push_log(&format!("🚫 [BLOCKED] {ip} | {reason}"));
     app.clamp_selected_indexes();
     drop(app);
 
@@ -67,7 +67,7 @@ pub async fn unblock_ip(
 
     let mut app = state.lock().await;
     app.blocked.retain(|blocked| blocked.ip != ip);
-    app.push_log(format!("✅ [UNBLOCKED] {ip}"));
+    app.push_log(&format!("✅ [UNBLOCKED] {ip}"));
     app.clamp_selected_indexes();
     drop(app);
 
@@ -75,5 +75,8 @@ pub async fn unblock_ip(
 }
 
 pub async fn push_action_error(state: &Arc<Mutex<AppState>>, action: &str, error: &anyhow::Error) {
-    state.lock().await.push_log(format!("❌ {action}: {error}"));
+    state
+        .lock()
+        .await
+        .push_log(&format!("❌ {action}: {error}"));
 }

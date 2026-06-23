@@ -30,6 +30,15 @@ pub struct LogSignal {
 pub struct SuspectSignal {
     pub ip: String,
     pub reason: String,
+    pub score_delta: u32,
+    pub confidence: SignalConfidence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalConfidence {
+    Low,
+    Medium,
+    High,
 }
 
 pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
@@ -58,6 +67,8 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
         signal.suspect = Some(SuspectSignal {
             ip,
             reason: "SSH Auth Failure".to_owned(),
+            score_delta: crate::constants::SSH_FAILURE_SCORE,
+            confidence: SignalConfidence::Medium,
         });
         return signal;
     }
@@ -73,6 +84,8 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
         signal.suspect = Some(SuspectSignal {
             ip,
             reason: format!("HTTP {status} Error"),
+            score_delta: http_error_score(status),
+            confidence: SignalConfidence::Low,
         });
         return signal;
     }
@@ -84,6 +97,8 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
         signal.suspect = Some(SuspectSignal {
             ip,
             reason: "IDS Alert".to_owned(),
+            score_delta: crate::constants::IDS_ALERT_SCORE,
+            confidence: SignalConfidence::High,
         });
     }
 
@@ -113,6 +128,8 @@ fn parse_suricata_json(line: &str) -> Option<LogSignal> {
             signal.suspect = Some(SuspectSignal {
                 ip,
                 reason: alert_reason(&value),
+                score_delta: crate::constants::IDS_ALERT_SCORE,
+                confidence: SignalConfidence::High,
             });
         }
         return Some(signal);
@@ -130,6 +147,8 @@ fn parse_suricata_json(line: &str) -> Option<LogSignal> {
             signal.suspect = Some(SuspectSignal {
                 ip,
                 reason: trim_reason(format!("HTTP {code} {}", http_summary(&value))),
+                score_delta: http_status_score(code),
+                confidence: SignalConfidence::Low,
             });
         }
     }
@@ -217,6 +236,20 @@ fn push_unique_ip(ips: &mut Vec<String>, ip: String) {
 fn merge_ips(target: &mut Vec<String>, ips: Vec<String>) {
     for ip in ips {
         push_unique_ip(target, ip);
+    }
+}
+
+fn http_error_score(status: &str) -> u32 {
+    status
+        .parse::<u64>()
+        .map_or(crate::constants::HTTP_CLIENT_ERROR_SCORE, http_status_score)
+}
+
+const fn http_status_score(status: u64) -> u32 {
+    if status >= 500 {
+        crate::constants::HTTP_SERVER_ERROR_SCORE
+    } else {
+        crate::constants::HTTP_CLIENT_ERROR_SCORE
     }
 }
 

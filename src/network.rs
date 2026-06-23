@@ -1,4 +1,6 @@
-use std::{collections::HashSet, net::Ipv4Addr, process::Command};
+use std::{collections::HashSet, env, net::Ipv4Addr, process::Command};
+
+use crate::constants::TRUSTED_IPS_ENV;
 
 pub fn normalize_ipv4(candidate: &str) -> Option<String> {
     candidate.parse::<Ipv4Addr>().ok().map(|ip| ip.to_string())
@@ -17,6 +19,17 @@ pub fn get_local_ips() -> HashSet<String> {
     collect_route_source_ip(&mut local_ips);
 
     local_ips
+}
+
+pub fn trusted_ips_from_env() -> HashSet<String> {
+    let Ok(value) = env::var(TRUSTED_IPS_ENV) else {
+        return HashSet::new();
+    };
+
+    value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .filter_map(normalize_ipv4)
+        .collect()
 }
 
 fn collect_hostname_ips(local_ips: &mut HashSet<String>) {
