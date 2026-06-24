@@ -1,7 +1,7 @@
 pub const DB_URL: &str = "sqlite://ravelin.db?mode=rwc";
 pub const LEARNING_PERIOD_HOURS: i64 = 12;
 pub const LOG_CAP: usize = 200;
-pub const HISTORY_CAP: usize = 128;
+pub const HISTORY_CAP: usize = 32;
 pub const IP_HISTORY_KEY_CAP: usize = 512;
 pub const RECENT_EVENT_CAP: usize = 20_000;
 pub const SUSPECT_CAP: usize = 1_000;
@@ -12,25 +12,31 @@ pub const SSH_FAILURE_SCORE: u32 = 10;
 pub const IDS_ALERT_SCORE: u32 = 25;
 pub const HTTP_CLIENT_ERROR_SCORE: u32 = 2;
 pub const HTTP_SERVER_ERROR_SCORE: u32 = 1;
+pub const HTTP_ERROR_BURST_SCORE: u32 = 18;
+pub const HTTP_SUCCESS_BURST_SCORE: u32 = 8;
 pub const MAX_REASON_LEN: usize = 180;
 pub const MAX_UI_LOG_LEN: usize = 512;
 pub const MAX_HISTORY_LINE_LEN: usize = 1_024;
 pub const MAX_LOG_LINE_BYTES: usize = 8_192;
 pub const MAX_COMMAND_BUFFER_CHARS: usize = 256;
+pub const HTTP_BEHAVIOR_IP_CAP: usize = 1_024;
+pub const HTTP_BEHAVIOR_EVENT_CAP: usize = 64;
+pub const HTTP_BEHAVIOR_WINDOW_SECS: i64 = 60;
+pub const HTTP_BEHAVIOR_SIGNAL_COOLDOWN_SECS: i64 = 30;
+pub const HTTP_BURST_WINDOW_SECS: i64 = 10;
+pub const HTTP_BURST_MIN_REQUESTS: usize = 30;
+pub const HTTP_ERROR_BURST_MIN_ERRORS: usize = 8;
+pub const HTTP_SUCCESS_BURST_MIN_REQUESTS: usize = 40;
+pub const HTTP_REGULAR_MIN_REQUESTS: usize = 12;
+pub const HTTP_REGULAR_MIN_AVG_GAP_MS: i64 = 250;
+pub const HTTP_REGULAR_MAX_AVG_GAP_MS: i64 = 1_500;
+pub const HTTP_REGULAR_MAX_JITTER_MS: i64 = 250;
 
 pub const EVENT_POLL_INTERVAL_MS: u64 = 100;
 pub const SURICATA_POLL_SECS: u64 = 2;
-pub const SSH_POLL_SECS: u64 = 2;
-pub const DOCKER_POLL_SECS: u64 = 10;
-pub const DOCKER_LOG_SINCE_SECS: u64 = 15;
-pub const DOCKER_LOG_TAIL: &str = "200";
 pub const SURICATA_MAX_LINES_PER_POLL: usize = 1_000;
-pub const DEFAULT_MAX_LINES_PER_POLL: usize = 500;
-pub const DOCKER_MAX_LINES_PER_POLL: usize = 500;
 
 pub const SURICATA_EVE_PATH: &str = "/var/log/suricata/eve.json";
-pub const AUTH_LOG_PATH: &str = "/var/log/auth.log";
-pub const SECURE_LOG_PATH: &str = "/var/log/secure";
 
 pub const IPSET_NAME: &str = "sentinel_block";
 pub const SETUP_PATH: &str = "/tmp/ravelin_setup.sh";

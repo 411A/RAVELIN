@@ -24,6 +24,7 @@ pub struct LogSignal {
     pub ips_found: Vec<String>,
     pub safe_ip: Option<String>,
     pub suspect: Option<SuspectSignal>,
+    pub http: Option<HttpSignal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +33,15 @@ pub struct SuspectSignal {
     pub reason: String,
     pub score_delta: u32,
     pub confidence: SignalConfidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpSignal {
+    pub ip: String,
+    pub status: u16,
+    pub method: String,
+    pub host: String,
+    pub url: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +65,7 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
         ips_found: fallback_ips,
         safe_ip: None,
         suspect: None,
+        http: None,
     };
 
     if let Some(ip) = capture_ipv4(&RE_SSH_SUCCESS, line) {
@@ -139,17 +150,11 @@ fn parse_suricata_json(line: &str) -> Option<LogSignal> {
         let status = value
             .get("http")
             .and_then(|http| http.get("status"))
-            .and_then(Value::as_u64);
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok());
 
-        if let Some(code) = status.filter(|code| (400..=599).contains(code))
-            && let Some(ip) = src_ip
-        {
-            signal.suspect = Some(SuspectSignal {
-                ip,
-                reason: trim_reason(format!("HTTP {code} {}", http_summary(&value))),
-                score_delta: http_status_score(code),
-                confidence: SignalConfidence::Low,
-            });
+        if let (Some(code), Some(ip)) = (status, src_ip.clone()) {
+            signal.http = Some(http_signal(&value, ip, code));
         }
     }
 
@@ -183,28 +188,39 @@ fn alert_reason(value: &Value) -> String {
     ))
 }
 
-fn http_summary(value: &Value) -> String {
+fn http_signal(value: &Value, ip: String, status: u16) -> HttpSignal {
     let Some(http) = value.get("http") else {
-        return "request".to_owned();
+        return HttpSignal {
+            ip,
+            status,
+            method: "-".to_owned(),
+            host: "-".to_owned(),
+            url: "/".to_owned(),
+        };
     };
 
-    let method = http
-        .get("http_method")
-        .or_else(|| http.get("method"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let host = http
-        .get("hostname")
-        .or_else(|| http.get("host"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let url = http
-        .get("url")
-        .or_else(|| http.get("http_url"))
-        .and_then(Value::as_str)
-        .unwrap_or("/");
-
-    trim_reason(format!("{method} {host}{url}"))
+    HttpSignal {
+        ip,
+        status,
+        method: http
+            .get("http_method")
+            .or_else(|| http.get("method"))
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_owned(),
+        host: http
+            .get("hostname")
+            .or_else(|| http.get("host"))
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_owned(),
+        url: http
+            .get("url")
+            .or_else(|| http.get("http_url"))
+            .and_then(Value::as_str)
+            .unwrap_or("/")
+            .to_owned(),
+    }
 }
 
 fn extract_ipv4s(line: &str) -> Vec<String> {
@@ -241,11 +257,11 @@ fn merge_ips(target: &mut Vec<String>, ips: Vec<String>) {
 
 fn http_error_score(status: &str) -> u32 {
     status
-        .parse::<u64>()
+        .parse::<u16>()
         .map_or(crate::constants::HTTP_CLIENT_ERROR_SCORE, http_status_score)
 }
 
-const fn http_status_score(status: u64) -> u32 {
+const fn http_status_score(status: u16) -> u32 {
     if status >= 500 {
         crate::constants::HTTP_SERVER_ERROR_SCORE
     } else {
@@ -282,16 +298,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_suricata_http_error_from_json() {
+    fn parses_suricata_http_response_from_json() {
         let signal = parse_log_line(
             r#"{"event_type":"http","src_ip":"8.8.8.8","dest_ip":"203.0.113.10","http":{"status":404,"hostname":"example.com","url":"/wp-login.php","http_method":"GET"}}"#,
             "Suricata",
         );
 
-        let suspect = signal.suspect.expect("HTTP 404 should be suspicious");
-        assert_eq!(suspect.ip, "8.8.8.8");
-        assert!(suspect.reason.contains("HTTP 404"));
-        assert!(suspect.reason.contains("/wp-login.php"));
+        let http = signal
+            .http
+            .expect("Suricata HTTP metadata should be captured");
+        assert_eq!(http.ip, "8.8.8.8");
+        assert_eq!(http.status, 404);
+        assert_eq!(http.method, "GET");
+        assert_eq!(http.host, "example.com");
+        assert_eq!(http.url, "/wp-login.php");
+        assert!(signal.suspect.is_none());
     }
 
     #[test]

@@ -4,12 +4,15 @@ use tokio::sync::Mutex;
 
 use crate::{
     constants::{
-        AUTO_BLOCK_SCORE_THRESHOLD, LEARNING_PERIOD_HOURS, MIN_AUTO_BLOCK_EVENTS,
-        MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS, SUSPECT_CAP,
+        AUTO_BLOCK_SCORE_THRESHOLD, HTTP_BEHAVIOR_SIGNAL_COOLDOWN_SECS, HTTP_BURST_MIN_REQUESTS,
+        HTTP_ERROR_BURST_MIN_ERRORS, HTTP_ERROR_BURST_SCORE, HTTP_REGULAR_MAX_AVG_GAP_MS,
+        HTTP_REGULAR_MAX_JITTER_MS, HTTP_REGULAR_MIN_AVG_GAP_MS, HTTP_REGULAR_MIN_REQUESTS,
+        HTTP_SUCCESS_BURST_MIN_REQUESTS, HTTP_SUCCESS_BURST_SCORE, LEARNING_PERIOD_HOURS,
+        MIN_AUTO_BLOCK_EVENTS, MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS, SUSPECT_CAP,
     },
-    models::{AppState, AutoBlock, Suspect},
+    models::{AppState, AutoBlock, HttpBehaviorSnapshot, Suspect},
     network::is_blockable_ip,
-    parser::{SignalConfidence, SuspectSignal, parse_log_line},
+    parser::{HttpSignal, SignalConfidence, SuspectSignal, parse_log_line},
 };
 
 pub async fn process_log_line(
@@ -30,6 +33,16 @@ pub async fn process_log_line(
     let mut app = state.lock().await;
     if !app.remember_event(source, line) {
         return None;
+    }
+
+    if let Some(http) = &signal.http
+        && source == "Suricata"
+        && let Some(suspect) = behavior_signal(&mut app, http)
+    {
+        app.push_history(&suspect.ip, &format!("[{source}] {line}"));
+        let auto_block = process_suspect_signal(&mut app, suspect, source);
+        drop(app);
+        return auto_block;
     }
 
     if let Some(ip) = signal.safe_ip {
@@ -53,6 +66,99 @@ pub async fn process_log_line(
     drop(app);
 
     auto_block
+}
+
+fn behavior_signal(app: &mut AppState, http: &HttpSignal) -> Option<SuspectSignal> {
+    if app.local_ips.contains(&http.ip)
+        || app.whitelisted_dynamic.contains(&http.ip)
+        || app.is_blocked(&http.ip)
+        || !is_blockable_ip(&http.ip)
+    {
+        return None;
+    }
+
+    let now = Utc::now();
+    let snapshot = app.observe_http(&http.ip, http.status, now);
+    let signal = classify_http_behavior(http, snapshot)?;
+    let behavior = app.http_behaviors.get_mut(&http.ip)?;
+    if behavior.last_signal_at.is_some_and(|last_signal_at| {
+        now.signed_duration_since(last_signal_at).num_seconds() < HTTP_BEHAVIOR_SIGNAL_COOLDOWN_SECS
+    }) {
+        return None;
+    }
+    behavior.last_signal_at = Some(now);
+    Some(signal)
+}
+
+fn classify_http_behavior(
+    http: &HttpSignal,
+    snapshot: HttpBehaviorSnapshot,
+) -> Option<SuspectSignal> {
+    if snapshot.burst_errors >= HTTP_ERROR_BURST_MIN_ERRORS
+        && snapshot.burst_total >= HTTP_BURST_MIN_REQUESTS
+    {
+        return Some(SuspectSignal {
+            ip: http.ip.clone(),
+            reason: format!(
+                "HTTP error burst: {} errors / {} requests; latest {} {}{} => {}",
+                snapshot.burst_errors,
+                snapshot.burst_total,
+                http.method,
+                http.host,
+                http.url,
+                http.status
+            ),
+            score_delta: HTTP_ERROR_BURST_SCORE,
+            confidence: SignalConfidence::Medium,
+        });
+    }
+
+    if snapshot.burst_total >= HTTP_SUCCESS_BURST_MIN_REQUESTS && snapshot.errors == 0 {
+        return Some(SuspectSignal {
+            ip: http.ip.clone(),
+            reason: format!(
+                "HTTP success burst: {} successful responses; latest {} {}{} => {}",
+                snapshot.successes, http.method, http.host, http.url, http.status
+            ),
+            score_delta: HTTP_SUCCESS_BURST_SCORE,
+            confidence: SignalConfidence::Low,
+        });
+    }
+
+    if is_predictable_cadence(snapshot) && snapshot.errors == 0 {
+        return Some(SuspectSignal {
+            ip: http.ip.clone(),
+            reason: format!(
+                "HTTP predictable cadence: {} successful responses; avg gap {:?}ms jitter {:?}ms; latest {} {}{} => {}",
+                snapshot.successes,
+                snapshot.average_gap_ms,
+                snapshot.jitter_ms,
+                http.method,
+                http.host,
+                http.url,
+                http.status
+            ),
+            score_delta: HTTP_SUCCESS_BURST_SCORE,
+            confidence: SignalConfidence::Low,
+        });
+    }
+
+    None
+}
+
+const fn is_predictable_cadence(snapshot: HttpBehaviorSnapshot) -> bool {
+    if snapshot.total < HTTP_REGULAR_MIN_REQUESTS {
+        return false;
+    }
+
+    match (snapshot.average_gap_ms, snapshot.jitter_ms) {
+        (Some(average_gap_ms), Some(jitter_ms)) => {
+            average_gap_ms >= HTTP_REGULAR_MIN_AVG_GAP_MS
+                && average_gap_ms <= HTTP_REGULAR_MAX_AVG_GAP_MS
+                && jitter_ms <= HTTP_REGULAR_MAX_JITTER_MS
+        }
+        _ => false,
+    }
 }
 
 fn process_suspect_signal(
@@ -158,10 +264,11 @@ mod tests {
     use std::{collections::HashSet, sync::Arc};
     use tokio::sync::Mutex;
 
-    use super::process_log_line;
+    use super::{classify_http_behavior, process_log_line};
     use crate::{
-        constants::{AUTO_BLOCK_SCORE_THRESHOLD, SSH_FAILURE_SCORE},
-        models::AppState,
+        constants::{AUTO_BLOCK_SCORE_THRESHOLD, HTTP_ERROR_BURST_SCORE, SSH_FAILURE_SCORE},
+        models::{AppState, HttpBehaviorSnapshot},
+        parser::{HttpSignal, SignalConfidence},
     };
 
     #[tokio::test]
@@ -226,5 +333,100 @@ mod tests {
         }
 
         assert!(auto_block.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_suricata_http_error_only_updates_behavior() {
+        let state = Arc::new(Mutex::new(AppState::new(
+            Vec::new(),
+            HashSet::new(),
+            Utc::now() - Duration::hours(13),
+            crate::models::RuntimeMode::Standalone,
+        )));
+
+        let line = r#"{"event_type":"http","src_ip":"8.8.4.4","dest_ip":"198.51.100.10","http":{"status":404,"hostname":"example.com","url":"/missing","http_method":"GET"}}"#;
+        assert!(process_log_line(line, "Suricata", &state).await.is_none());
+
+        let (has_no_suspects, has_no_history, tracks_behavior) = {
+            let app = state.lock().await;
+            (
+                app.suspects.is_empty(),
+                app.ip_history.is_empty(),
+                app.http_behaviors.contains_key("8.8.4.4"),
+            )
+        };
+        assert!(has_no_suspects);
+        assert!(has_no_history);
+        assert!(tracks_behavior);
+    }
+
+    #[test]
+    fn http_error_burst_becomes_medium_confidence_behavior_signal() {
+        let http = http_signal(404);
+        let signal = classify_http_behavior(
+            &http,
+            HttpBehaviorSnapshot {
+                total: 30,
+                successes: 22,
+                errors: 8,
+                burst_total: 30,
+                burst_errors: 8,
+                average_gap_ms: Some(300),
+                jitter_ms: Some(120),
+            },
+        )
+        .expect("error burst should be suspicious");
+
+        assert_eq!(signal.ip, "8.8.4.4");
+        assert_eq!(signal.score_delta, HTTP_ERROR_BURST_SCORE);
+        assert_eq!(signal.confidence, SignalConfidence::Medium);
+    }
+
+    #[test]
+    fn sparse_non_linear_successful_http_is_not_suspicious() {
+        let signal = classify_http_behavior(
+            &http_signal(200),
+            HttpBehaviorSnapshot {
+                total: 8,
+                successes: 8,
+                errors: 0,
+                burst_total: 2,
+                burst_errors: 0,
+                average_gap_ms: Some(4_000),
+                jitter_ms: Some(3_200),
+            },
+        );
+
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn predictable_successful_cadence_is_low_confidence_behavior_signal() {
+        let signal = classify_http_behavior(
+            &http_signal(200),
+            HttpBehaviorSnapshot {
+                total: 12,
+                successes: 12,
+                errors: 0,
+                burst_total: 6,
+                burst_errors: 0,
+                average_gap_ms: Some(750),
+                jitter_ms: Some(20),
+            },
+        )
+        .expect("machine-like cadence should be suspicious");
+
+        assert_eq!(signal.confidence, SignalConfidence::Low);
+        assert!(signal.reason.contains("predictable cadence"));
+    }
+
+    fn http_signal(status: u16) -> HttpSignal {
+        HttpSignal {
+            ip: "8.8.4.4".to_owned(),
+            status,
+            method: "GET".to_owned(),
+            host: "example.com".to_owned(),
+            url: "/probe".to_owned(),
+        }
     }
 }

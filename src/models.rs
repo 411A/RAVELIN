@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::constants::{
-    HISTORY_CAP, IP_HISTORY_KEY_CAP, LOG_CAP, MAX_HISTORY_LINE_LEN, MAX_UI_LOG_LEN,
-    RECENT_EVENT_CAP,
+    HISTORY_CAP, HTTP_BEHAVIOR_EVENT_CAP, HTTP_BEHAVIOR_IP_CAP, HTTP_BEHAVIOR_WINDOW_SECS,
+    IP_HISTORY_KEY_CAP, LOG_CAP, MAX_HISTORY_LINE_LEN, MAX_UI_LOG_LEN, RECENT_EVENT_CAP,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +46,7 @@ pub struct AppState {
     pub suspects_scroll: usize,
     pub blocked_scroll: usize,
     pub ip_history: HashMap<String, Vec<String>>,
+    pub http_behaviors: HashMap<String, HttpBehavior>,
     pub detail_open: bool,
     pub detail_ip: Option<String>,
     pub detail_scroll: usize,
@@ -55,6 +56,7 @@ pub struct AppState {
     recent_event_keys: VecDeque<u64>,
     recent_event_set: HashSet<u64>,
     ip_history_order: VecDeque<String>,
+    http_behavior_order: VecDeque<String>,
 }
 
 impl AppState {
@@ -80,6 +82,7 @@ impl AppState {
             suspects_scroll: 0,
             blocked_scroll: 0,
             ip_history: HashMap::new(),
+            http_behaviors: HashMap::new(),
             detail_open: false,
             detail_ip: None,
             detail_scroll: 0,
@@ -89,6 +92,7 @@ impl AppState {
             recent_event_keys: VecDeque::new(),
             recent_event_set: HashSet::new(),
             ip_history_order: VecDeque::new(),
+            http_behavior_order: VecDeque::new(),
         }
     }
 
@@ -123,6 +127,31 @@ impl AppState {
                 self.ip_history.remove(&oldest_ip);
             }
         }
+    }
+
+    pub fn observe_http(
+        &mut self,
+        ip: &str,
+        status: u16,
+        now: DateTime<Utc>,
+    ) -> HttpBehaviorSnapshot {
+        if !self.http_behaviors.contains_key(ip) {
+            self.http_behavior_order.push_back(ip.to_owned());
+        }
+
+        let snapshot = {
+            let behavior = self.http_behaviors.entry(ip.to_owned()).or_default();
+            behavior.observe(status, now);
+            behavior.snapshot(now)
+        };
+
+        while self.http_behaviors.len() > HTTP_BEHAVIOR_IP_CAP {
+            if let Some(oldest_ip) = self.http_behavior_order.pop_front() {
+                self.http_behaviors.remove(&oldest_ip);
+            }
+        }
+
+        snapshot
     }
 
     pub fn remember_event(&mut self, source: &str, line: &str) -> bool {
@@ -202,6 +231,88 @@ pub struct AutoBlock {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct HttpBehavior {
+    events: VecDeque<HttpObservation>,
+    pub last_signal_at: Option<DateTime<Utc>>,
+}
+
+impl HttpBehavior {
+    fn observe(&mut self, status: u16, now: DateTime<Utc>) {
+        self.events.push_back(HttpObservation { at: now, status });
+
+        while self.events.len() > HTTP_BEHAVIOR_EVENT_CAP {
+            self.events.pop_front();
+        }
+
+        let cutoff = now - chrono::Duration::seconds(HTTP_BEHAVIOR_WINDOW_SECS);
+        while self.events.front().is_some_and(|event| event.at < cutoff) {
+            self.events.pop_front();
+        }
+    }
+
+    fn snapshot(&self, now: DateTime<Utc>) -> HttpBehaviorSnapshot {
+        let mut total = 0;
+        let mut successes = 0;
+        let mut errors = 0;
+        let mut burst_total = 0;
+        let mut burst_errors = 0;
+        let mut previous_at = None;
+        let mut gaps_ms = Vec::new();
+        let burst_cutoff =
+            now - chrono::Duration::seconds(crate::constants::HTTP_BURST_WINDOW_SECS);
+
+        for event in &self.events {
+            total += 1;
+            if is_success_status(event.status) {
+                successes += 1;
+            } else if is_error_status(event.status) {
+                errors += 1;
+            }
+
+            if event.at >= burst_cutoff {
+                burst_total += 1;
+                if is_error_status(event.status) {
+                    burst_errors += 1;
+                }
+            }
+
+            if let Some(previous) = previous_at {
+                gaps_ms.push(event.at.signed_duration_since(previous).num_milliseconds());
+            }
+            previous_at = Some(event.at);
+        }
+
+        let (average_gap_ms, jitter_ms) = gap_summary(&gaps_ms);
+        HttpBehaviorSnapshot {
+            total,
+            successes,
+            errors,
+            burst_total,
+            burst_errors,
+            average_gap_ms,
+            jitter_ms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HttpBehaviorSnapshot {
+    pub total: usize,
+    pub successes: usize,
+    pub errors: usize,
+    pub burst_total: usize,
+    pub burst_errors: usize,
+    pub average_gap_ms: Option<i64>,
+    pub jitter_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HttpObservation {
+    at: DateTime<Utc>,
+    status: u16,
+}
+
 fn clamp_index(index: usize, len: usize) -> usize {
     if len == 0 { 0 } else { index.min(len - 1) }
 }
@@ -226,4 +337,33 @@ fn compact_event_key(source: &str, line: &str) -> u64 {
     source.hash(&mut hasher);
     line.hash(&mut hasher);
     hasher.finish()
+}
+
+const fn is_success_status(status: u16) -> bool {
+    status >= 200 && status < 400
+}
+
+const fn is_error_status(status: u16) -> bool {
+    status >= 400
+}
+
+fn gap_summary(gaps_ms: &[i64]) -> (Option<i64>, Option<i64>) {
+    let Some(total) = gaps_ms
+        .iter()
+        .try_fold(0_i64, |acc, gap| acc.checked_add(*gap))
+    else {
+        return (None, None);
+    };
+    let Some(count) = i64::try_from(gaps_ms.len()).ok().filter(|count| *count > 0) else {
+        return (None, None);
+    };
+
+    let average = total / count;
+    let jitter = gaps_ms
+        .iter()
+        .map(|gap| (*gap - average).abs())
+        .max()
+        .unwrap_or_default();
+
+    (Some(average), Some(jitter))
 }
