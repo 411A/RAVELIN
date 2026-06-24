@@ -24,6 +24,14 @@ RAVELIN treats Suricata as the packet sensor and the Rust engine as the decision
 
 ## Install
 
+Latest Linux x86_64 release:
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/411A/RAVELIN/main/install-latest.sh | sudo sh
+```
+
+Build from source:
+
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"

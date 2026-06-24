@@ -26,7 +26,7 @@ pub fn system_self_check() -> Result<()> {
         .with_context(|| format!("failed to chmod setup script at {SETUP_PATH}"))?;
 
     run_checked(
-        privileged_command(SETUP_PATH, &[]),
+        privileged_command("bash", &[SETUP_PATH]),
         "Ravelin dependency and firewall setup",
     )
 }

@@ -44,13 +44,16 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+      - name: Strict Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery
+
       - name: Tests
-        run: cargo test --locked
+        run: cargo test --locked --all-targets --all-features
 
       - name: Build static release binary (musl)
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
@@ -66,6 +69,8 @@ jobs:
 
           cp target/x86_64-unknown-linux-musl/release/ravelin "$pkg/ravelin"
           chmod +x "$pkg/ravelin"
+          cp install-latest.sh "$pkg/install-latest.sh"
+          chmod +x "$pkg/install-latest.sh"
 
           cat > "$pkg/ravelin.service" <<'UNIT'
           [Unit]
@@ -97,11 +102,27 @@ jobs:
 
           echo "[Ravelin] Installing dependencies..."
           if [ -f /etc/debian_version ]; then
-            apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y suricata ipset jq
+            missing=()
+            for pkg in suricata ipset jq iptables; do
+              if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+                missing+=("$pkg")
+              fi
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              apt-get update -qq || echo "[Ravelin] Warning: apt update reported repository warnings; using available package indexes." >&2
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+            fi
           elif [ -f /etc/redhat-release ]; then
-            yum install -y epel-release
-            yum install -y suricata ipset jq
+            missing=()
+            for pkg in suricata ipset jq iptables; do
+              if ! rpm -q "$pkg" >/dev/null 2>&1; then
+                missing+=("$pkg")
+              fi
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              yum install -y epel-release || true
+              yum install -y "${missing[@]}"
+            fi
           else
             echo "Warning: unsupported distro, install suricata ipset jq manually" >&2
           fi
@@ -117,15 +138,21 @@ jobs:
           echo "[Ravelin] Configuring firewall..."
           ipset create sentinel_block hash:ip timeout 0 -exist 2>/dev/null || true
 
-          if ! iptables -C INPUT -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
-            iptables -I INPUT -m set --match-set sentinel_block src -j DROP
-          fi
-
-          if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
-            if ! iptables -C DOCKER-USER -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
-              iptables -I DOCKER-USER -m set --match-set sentinel_block src -j DROP
+          ensure_drop_rule() {
+            chain="$1"
+            if ! iptables -L "$chain" -n >/dev/null 2>&1; then
+              return
             fi
-          fi
+
+            while iptables -D "$chain" -m set --match-set sentinel_block src -j DROP 2>/dev/null; do
+              true
+            done
+
+            iptables -I "$chain" 1 -m set --match-set sentinel_block src -j DROP
+          }
+
+          ensure_drop_rule INPUT
+          ensure_drop_rule DOCKER-USER
 
           echo "[Ravelin] Tuning network stack..."
           sysctl -w net.core.netdev_max_backlog=500000 >/dev/null || true
