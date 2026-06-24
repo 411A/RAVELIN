@@ -9,6 +9,7 @@ use crate::{
         HTTP_REGULAR_MAX_JITTER_MS, HTTP_REGULAR_MIN_AVG_GAP_MS, HTTP_REGULAR_MIN_REQUESTS,
         HTTP_SUCCESS_BURST_MIN_REQUESTS, HTTP_SUCCESS_BURST_SCORE, LEARNING_PERIOD_HOURS,
         MIN_AUTO_BLOCK_EVENTS, MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS, SUSPECT_CAP,
+        VERY_HIGH_BURST_MIN_REQUESTS,
     },
     models::{AppState, AutoBlock, HttpBehaviorSnapshot, Suspect},
     network::is_blockable_ip,
@@ -94,6 +95,24 @@ fn classify_http_behavior(
     http: &HttpSignal,
     snapshot: HttpBehaviorSnapshot,
 ) -> Option<SuspectSignal> {
+    if snapshot.burst_total >= VERY_HIGH_BURST_MIN_REQUESTS && snapshot.successes == 0 {
+        return Some(SuspectSignal {
+            ip: http.ip.clone(),
+            reason: format!(
+                "HTTP VERY HIGH: {} failed / {} total requests; latest {} {}{} => {}",
+                snapshot.burst_errors,
+                snapshot.burst_total,
+                http.method,
+                http.host,
+                http.url,
+                http.status
+            ),
+            score_delta: 0,
+            confidence: SignalConfidence::High,
+            very_high: true,
+        });
+    }
+
     if snapshot.burst_errors >= HTTP_ERROR_BURST_MIN_ERRORS
         && snapshot.burst_total >= HTTP_BURST_MIN_REQUESTS
     {
@@ -110,6 +129,7 @@ fn classify_http_behavior(
             ),
             score_delta: HTTP_ERROR_BURST_SCORE,
             confidence: SignalConfidence::Medium,
+            very_high: false,
         });
     }
 
@@ -122,6 +142,7 @@ fn classify_http_behavior(
             ),
             score_delta: HTTP_SUCCESS_BURST_SCORE,
             confidence: SignalConfidence::Low,
+            very_high: false,
         });
     }
 
@@ -140,6 +161,7 @@ fn classify_http_behavior(
             ),
             score_delta: HTTP_SUCCESS_BURST_SCORE,
             confidence: SignalConfidence::Low,
+            very_high: false,
         });
     }
 
@@ -230,6 +252,16 @@ fn process_suspect_signal(
         app.suspects.truncate(SUSPECT_CAP);
     }
     app.clamp_selected_indexes();
+
+    if suspect.very_high {
+        return Some(AutoBlock {
+            ip: suspect.ip,
+            reason: format!(
+                "Auto Block: {} (VERY HIGH confidence immediate block)",
+                suspect.reason
+            ),
+        });
+    }
 
     let learning_complete =
         now.signed_duration_since(app.start_time).num_hours() >= LEARNING_PERIOD_HOURS;
@@ -380,6 +412,7 @@ mod tests {
         assert_eq!(signal.ip, "8.8.4.4");
         assert_eq!(signal.score_delta, HTTP_ERROR_BURST_SCORE);
         assert_eq!(signal.confidence, SignalConfidence::Medium);
+        assert!(!signal.very_high);
     }
 
     #[test]
@@ -418,6 +451,28 @@ mod tests {
 
         assert_eq!(signal.confidence, SignalConfidence::Low);
         assert!(signal.reason.contains("predictable cadence"));
+        assert!(!signal.very_high);
+    }
+
+    #[test]
+    fn very_high_burst_triggers_immediate_block_signal() {
+        let http = http_signal(404);
+        let signal = classify_http_behavior(
+            &http,
+            HttpBehaviorSnapshot {
+                total: 120,
+                successes: 0,
+                errors: 120,
+                burst_total: 120,
+                burst_errors: 120,
+                average_gap_ms: Some(80),
+                jitter_ms: Some(20),
+            },
+        )
+        .expect("100% failure burst should be very high");
+
+        assert!(signal.very_high);
+        assert!(signal.reason.contains("VERY HIGH"));
     }
 
     fn http_signal(status: u16) -> HttpSignal {

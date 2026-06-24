@@ -33,6 +33,7 @@ pub struct SuspectSignal {
     pub reason: String,
     pub score_delta: u32,
     pub confidence: SignalConfidence,
+    pub very_high: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +81,7 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
             reason: "SSH Auth Failure".to_owned(),
             score_delta: crate::constants::SSH_FAILURE_SCORE,
             confidence: SignalConfidence::Medium,
+            very_high: false,
         });
         return signal;
     }
@@ -97,6 +99,7 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
             reason: format!("HTTP {status} Error"),
             score_delta: http_error_score(status),
             confidence: SignalConfidence::Low,
+            very_high: false,
         });
         return signal;
     }
@@ -110,6 +113,7 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
             reason: "IDS Alert".to_owned(),
             score_delta: crate::constants::IDS_ALERT_SCORE,
             confidence: SignalConfidence::High,
+            very_high: false,
         });
     }
 
@@ -141,6 +145,7 @@ fn parse_suricata_json(line: &str) -> Option<LogSignal> {
                 reason: alert_reason(&value),
                 score_delta: crate::constants::IDS_ALERT_SCORE,
                 confidence: SignalConfidence::High,
+                very_high: false,
             });
         }
         return Some(signal);
