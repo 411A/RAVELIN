@@ -36,7 +36,12 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Install musl-tools
-        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+        shell: bash
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-*.list /etc/apt/sources.list.d/azure-*.list 2>/dev/null || true
+          sudo sed -i 's/^deb /# deb /' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update -qq || true
+          sudo apt-get install -y musl-tools
 
       - name: Format check
         run: cargo fmt --check
@@ -196,6 +201,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
 
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -212,13 +219,20 @@ jobs:
       - name: Create or update release
         shell: bash
         run: |
-          git log -1 --format=%b > release-notes.txt
-          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$TAG_NAME" --repo "$REPOSITORY" --notes-file release-notes.txt
-            gh release upload "$TAG_NAME" dist/* --clobber --repo "$REPOSITORY"
-          else
-            gh release create "$TAG_NAME" dist/* \
-              --repo "$REPOSITORY" \
-              --title "Ravelin $TAG_NAME" \
-              --notes-file release-notes.txt
+          body=$(git log -1 --format=%b)
+          if [ -z "$body" ]; then
+            body="Release $TAG_NAME"
           fi
+          echo "$body" > release-notes.txt
+          echo "---" >> release-notes.txt
+          echo "" >> release-notes.txt
+          echo '```' >> release-notes.txt
+          cat dist/checksums.txt >> release-notes.txt
+          echo '```' >> release-notes.txt
+          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG_NAME" --repo "$REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$TAG_NAME" dist/* \
+            --repo "$REPOSITORY" \
+            --title "Ravelin $TAG_NAME" \
+            --notes-file release-notes.txt

@@ -19,7 +19,8 @@ pub fn system_self_check() -> Result<()> {
         println!("Verifying Ravelin firewall rules...");
     }
 
-    fs::write(SETUP_PATH, INSTALLER_SCRIPT)
+    let script = INSTALLER_SCRIPT.replace('\r', "");
+    fs::write(SETUP_PATH, script)
         .with_context(|| format!("failed to write setup script at {SETUP_PATH}"))?;
     fs::set_permissions(SETUP_PATH, Permissions::from_mode(0o755))
         .with_context(|| format!("failed to chmod setup script at {SETUP_PATH}"))?;
