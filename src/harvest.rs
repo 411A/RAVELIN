@@ -52,6 +52,7 @@ async fn follow_file(
 ) {
     let mut position = 0;
     let mut initialized = false;
+    let mut missing_log_reported = false;
 
     loop {
         match read_new_lines(
@@ -64,12 +65,34 @@ async fn follow_file(
         .await
         {
             Ok(lines) => {
+                if missing_log_reported {
+                    push_harvest_status(
+                        &app_state,
+                        config.source,
+                        &format!("{} is available; live harvesting resumed", config.path),
+                    )
+                    .await;
+                    missing_log_reported = false;
+                }
+
                 for line in lines {
                     handle_line(&line, config.source, &app_state, &pool).await;
                 }
             }
             Err(error) => {
-                push_harvest_error(&app_state, config.source, &error).await;
+                if is_not_found(&error) {
+                    if !missing_log_reported {
+                        push_harvest_status(
+                            &app_state,
+                            config.source,
+                            &format!("waiting for {} to be created by Suricata", config.path),
+                        )
+                        .await;
+                        missing_log_reported = true;
+                    }
+                } else {
+                    push_harvest_error(&app_state, config.source, &error).await;
+                }
             }
         }
 
@@ -150,9 +173,47 @@ async fn push_harvest_error(app_state: &Arc<Mutex<AppState>>, source: &str, erro
         .push_log(&format!("⚠️ [{source}] log harvest error: {error}"));
 }
 
+async fn push_harvest_status(app_state: &Arc<Mutex<AppState>>, source: &str, message: &str) {
+    app_state
+        .lock()
+        .await
+        .push_log(&format!("ℹ️ [{source}] {message}"));
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 async fn sleep_or_shutdown(interval: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         () = time::sleep(interval) => false,
         changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_not_found;
+
+    #[test]
+    fn detects_missing_suricata_log_errors() {
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing eve.json",
+        ));
+
+        assert!(is_not_found(&error));
+    }
+
+    #[test]
+    fn keeps_other_harvest_errors_visible() {
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+
+        assert!(!is_not_found(&error));
     }
 }
