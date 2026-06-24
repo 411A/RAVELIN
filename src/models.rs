@@ -223,6 +223,18 @@ impl RuntimeMode {
             Self::Standalone => "STANDALONE",
         }
     }
+
+    pub const fn requires_privileged_setup(self) -> bool {
+        matches!(self, Self::Daemon | Self::Standalone)
+    }
+
+    pub const fn command_hint(self) -> &'static str {
+        match self {
+            Self::Tui => "ravelin",
+            Self::Daemon => "sudo ravelin daemon",
+            Self::Standalone => "sudo ravelin standalone",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,4 +378,25 @@ fn gap_summary(gaps_ms: &[i64]) -> (Option<i64>, Option<i64>) {
         .unwrap_or_default();
 
     (Some(average), Some(jitter))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeMode;
+
+    #[test]
+    fn default_runtime_mode_is_simple_tui() {
+        let mode = RuntimeMode::from_arg(None);
+
+        assert_eq!(mode, RuntimeMode::Tui);
+        assert!(!mode.requires_privileged_setup());
+        assert_eq!(mode.command_hint(), "ravelin");
+    }
+
+    #[test]
+    fn protector_modes_require_privileged_setup() {
+        for mode in [RuntimeMode::Daemon, RuntimeMode::Standalone] {
+            assert!(mode.requires_privileged_setup());
+        }
+    }
 }

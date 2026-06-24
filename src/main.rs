@@ -9,7 +9,7 @@ mod network;
 mod parser;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -31,17 +31,24 @@ use crate::{
 async fn main() -> Result<()> {
     let runtime_mode = RuntimeMode::from_arg(env::args().nth(1).as_deref());
     println!(
-        "Starting Ravelin {} - ensuring dependencies and DB...",
-        runtime_mode.label()
+        "Starting Ravelin {} ({})...",
+        runtime_mode.label(),
+        runtime_mode.command_hint()
     );
 
-    firewall::system_self_check()?;
+    if runtime_mode.requires_privileged_setup() {
+        ensure_root(runtime_mode)?;
+        println!("Ensuring Ravelin dependencies, firewall rules, and database are ready...");
+        firewall::system_self_check()?;
+    } else {
+        println!("Opening local TUI. Start protection with: sudo systemctl start ravelin");
+    }
 
     let pool = db::init_db().await?;
     let start_time = db::get_start_time(&pool).await?;
     let initial_blocked = db::load_blocked(&pool).await?;
 
-    if !initial_blocked.is_empty() {
+    if runtime_mode.requires_privileged_setup() && !initial_blocked.is_empty() {
         println!(
             "Restoring firewall rules for {} blocked IPs...",
             initial_blocked.len()
@@ -56,6 +63,27 @@ async fn main() -> Result<()> {
         RuntimeMode::Daemon => run_daemon(pool, app_state).await,
         RuntimeMode::Standalone => run_standalone(pool, app_state).await,
     }
+}
+
+fn ensure_root(runtime_mode: RuntimeMode) -> Result<()> {
+    if running_as_root() {
+        return Ok(());
+    }
+
+    bail!(
+        "Ravelin {} needs root for Suricata, ipset, and firewall setup. Run: {}",
+        runtime_mode.label(),
+        runtime_mode.command_hint()
+    );
+}
+
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|uid| uid.trim() == "0")
 }
 
 fn build_app_state(

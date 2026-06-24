@@ -43,13 +43,13 @@ cargo build --release
 ## Run
 
 ```shell
-# TUI only; protection backbone should be managed separately.
-sudo ./target/release/ravelin
+# TUI only; protection backbone is managed separately.
+./target/release/ravelin
 
 # Backbone only; stop with systemctl/SIGTERM, not the TUI.
 sudo ./target/release/ravelin daemon
 
-# TUI and backbone in one foreground process.
+# TUI and backbone in one foreground root process.
 sudo ./target/release/ravelin standalone
 ```
 

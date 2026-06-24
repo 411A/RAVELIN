@@ -172,8 +172,9 @@ jobs:
           LOGROTATE
 
           echo ""
-          echo "[Ravelin] Installed. Start with:  systemctl start ravelin"
-          echo "[Ravelin] View TUI locally:       ravelin standalone"
+          echo "[Ravelin] Installed. Start protection:  sudo systemctl start ravelin"
+          echo "[Ravelin] Open TUI:                  ravelin"
+          echo "[Ravelin] Foreground all-in-one:     sudo ravelin standalone"
           echo "[Ravelin] View logs:              journalctl -u ravelin -f"
           INSTALL
           chmod +x "$pkg/install.sh"

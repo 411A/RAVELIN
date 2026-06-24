@@ -41,7 +41,7 @@ pub const SURICATA_MAX_LINES_PER_POLL: usize = 1_000;
 pub const SURICATA_EVE_PATH: &str = "/var/log/suricata/eve.json";
 
 pub const IPSET_NAME: &str = "sentinel_block";
-pub const SETUP_PATH: &str = "/tmp/ravelin_setup.sh";
+pub const SETUP_PATH_PREFIX: &str = "/tmp/ravelin_setup_";
 pub const MANUAL_BLOCK_REASON: &str = "Manual Block";
 pub const TRUSTED_IPS_ENV: &str = "RAVELIN_TRUSTED_IPS";
 pub const BACKBONE_SERVICE_NAME: &str = "ravelin.service";
