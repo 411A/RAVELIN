@@ -63,14 +63,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
-          pkg="dist/ravelin-${version}-linux-x86_64"
+          pkg="dist/ravelin-linux-x86_64"
           mkdir -p "$pkg"
 
           cp target/x86_64-unknown-linux-musl/release/ravelin "$pkg/ravelin"
           chmod +x "$pkg/ravelin"
           cp install-latest.sh "$pkg/install-latest.sh"
           chmod +x "$pkg/install-latest.sh"
+          printf '%s\n' "${GITHUB_REF_NAME:-manual}" > "$pkg/VERSION"
 
           cat > "$pkg/ravelin.service" <<'UNIT'
           [Unit]
@@ -208,13 +208,13 @@ jobs:
           UNINSTALL
           chmod +x "$pkg/uninstall.sh"
 
-          tar -C dist -czf "dist/ravelin-${version}-linux-x86_64.tar.gz" "ravelin-${version}-linux-x86_64"
+          tar -C dist -czf "dist/ravelin-linux-x86_64.tar.gz" "ravelin-linux-x86_64"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ravelin-linux-x86_64
-          path: dist/ravelin-*-linux-x86_64.tar.gz
+          name: ravelin-linux-x86_64-package
+          path: dist/ravelin-linux-x86_64.tar.gz
           if-no-files-found: error
 
   publish:
@@ -242,25 +242,45 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum *.tar.gz > checksums.txt
+          sha256sum ravelin-linux-x86_64.tar.gz > checksums.txt
 
       - name: Create or update release
         shell: bash
         run: |
-          body=$(git log -1 --format=%b)
-          if [ -z "$body" ]; then
-            body="Release $TAG_NAME"
-          fi
-          echo "$body" > release-notes.txt
-          echo "---" >> release-notes.txt
-          echo "" >> release-notes.txt
-          echo '```' >> release-notes.txt
+          {
+            echo "## RAVELIN $TAG_NAME"
+            echo ""
+            echo "Linux x86_64 release package for RAVELIN."
+            echo ""
+            echo "### Install"
+            echo ""
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/411A/RAVELIN/main/install-latest.sh | sudo sh"
+            echo '```'
+            echo ""
+            echo "### Assets"
+            echo ""
+            echo "- ravelin-linux-x86_64.tar.gz"
+            echo "- checksums.txt"
+            echo ""
+            echo "### SHA-256"
+            echo ""
+            echo '```'
+          } > release-notes.txt
           cat dist/checksums.txt >> release-notes.txt
           echo '```' >> release-notes.txt
+
           if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            gh release delete "$TAG_NAME" --repo "$REPOSITORY" --yes --cleanup-tag
+            gh release edit "$TAG_NAME" \
+              --repo "$REPOSITORY" \
+              --title "RAVELIN $TAG_NAME" \
+              --notes-file release-notes.txt
+            gh release upload "$TAG_NAME" dist/* \
+              --repo "$REPOSITORY" \
+              --clobber
+          else
+            gh release create "$TAG_NAME" dist/* \
+              --repo "$REPOSITORY" \
+              --title "RAVELIN $TAG_NAME" \
+              --notes-file release-notes.txt
           fi
-          gh release create "$TAG_NAME" dist/* \
-            --repo "$REPOSITORY" \
-            --title "Ravelin $TAG_NAME" \
-            --notes-file release-notes.txt

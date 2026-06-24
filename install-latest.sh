@@ -6,7 +6,8 @@ api_url="https://api.github.com/repos/${repo}/releases/latest"
 
 case "$(uname -m)" in
   x86_64 | amd64)
-    asset_pattern='linux-x86_64\.tar\.gz'
+    asset_name='ravelin-linux-x86_64.tar.gz'
+    legacy_asset_pattern='ravelin-[0-9][^/]*-linux-x86_64\.tar\.gz'
     ;;
   *)
     echo "RAVELIN installer error: unsupported architecture $(uname -m)" >&2
@@ -36,13 +37,15 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[RAVELIN] Resolving latest Linux release..."
-asset_url="$(
+asset_urls="$(
   curl -fsSL "$api_url" \
-    | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | grep -E "$asset_pattern" \
-    | head -n 1 \
-    || true
+    | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p'
 )"
+
+asset_url="$(printf '%s\n' "$asset_urls" | grep -F "/${asset_name}" | head -n 1 || true)"
+if [ -z "$asset_url" ]; then
+  asset_url="$(printf '%s\n' "$asset_urls" | grep -E "/${legacy_asset_pattern}$" | head -n 1 || true)"
+fi
 
 if [ -z "$asset_url" ]; then
   echo "RAVELIN installer error: no matching release asset found for $(uname -m)" >&2
