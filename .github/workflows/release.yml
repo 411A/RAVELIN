@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ravelin-linux-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo build state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-build-${{ runner.os }}-x86_64-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-build-${{ runner.os }}-x86_64-
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Stage package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          pkg="dist/ravelin-${version}-linux-x86_64"
+          mkdir -p "$pkg"
+
+          cp target/release/ravelin "$pkg/ravelin"
+          chmod +x "$pkg/ravelin"
+
+          cat > "$pkg/ravelin.service" <<'UNIT'
+          [Unit]
+          Description=Ravelin - Suricata-backed intruder detection
+          After=network-online.target suricata.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/ravelin daemon
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          cat > "$pkg/install.sh" <<'INSTALL'
+          #!/bin/bash
+          set -euo pipefail
+
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "Error: must be run as root" >&2
+            exit 1
+          fi
+
+          dir="$(cd "$(dirname "$0")" && pwd)"
+
+          echo "[Ravelin] Installing dependencies..."
+          if [ -f /etc/debian_version ]; then
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y suricata ipset jq
+          elif [ -f /etc/redhat-release ]; then
+            yum install -y epel-release
+            yum install -y suricata ipset jq
+          else
+            echo "Warning: unsupported distro, install suricata ipset jq manually" >&2
+          fi
+
+          echo "[Ravelin] Installing binary..."
+          install -Dm755 "$dir/ravelin" /usr/local/bin/ravelin
+
+          echo "[Ravelin] Installing systemd service..."
+          install -Dm644 "$dir/ravelin.service" /etc/systemd/system/ravelin.service
+          systemctl daemon-reload
+          systemctl enable ravelin.service
+
+          echo "[Ravelin] Configuring firewall..."
+          ipset create sentinel_block hash:ip timeout 0 -exist 2>/dev/null || true
+
+          if ! iptables -C INPUT -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
+            iptables -I INPUT -m set --match-set sentinel_block src -j DROP
+          fi
+
+          if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+            if ! iptables -C DOCKER-USER -m set --match-set sentinel_block src -j DROP 2>/dev/null; then
+              iptables -I DOCKER-USER -m set --match-set sentinel_block src -j DROP
+            fi
+          fi
+
+          echo "[Ravelin] Tuning network stack..."
+          sysctl -w net.core.netdev_max_backlog=500000 >/dev/null || true
+          sysctl -w net.core.rmem_max=134217728 >/dev/null || true
+
+          echo "[Ravelin] Setting up log rotation..."
+          cat >/etc/logrotate.d/ravelin-suricata <<'LOGROTATE'
+          /var/log/suricata/eve.json /var/log/suricata/fast.log /var/log/suricata/stats.log {
+            size 64M
+            rotate 4
+            compress
+            delaycompress
+            missingok
+            notifempty
+            copytruncate
+          }
+          LOGROTATE
+
+          echo ""
+          echo "[Ravelin] Installed. Start with:  systemctl start ravelin"
+          echo "[Ravelin] View TUI locally:       ravelin standalone"
+          echo "[Ravelin] View logs:              journalctl -u ravelin -f"
+          INSTALL
+          chmod +x "$pkg/install.sh"
+
+          cat > "$pkg/uninstall.sh" <<'UNINSTALL'
+          #!/bin/bash
+          set -euo pipefail
+
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "Error: must be run as root" >&2
+            exit 1
+          fi
+
+          echo "[Ravelin] Stopping service..."
+          systemctl stop ravelin.service 2>/dev/null || true
+          systemctl disable ravelin.service 2>/dev/null || true
+
+          echo "[Ravelin] Removing files..."
+          rm -f /usr/local/bin/ravelin
+          rm -f /etc/systemd/system/ravelin.service
+          rm -f /etc/logrotate.d/ravelin-suricata
+          systemctl daemon-reload
+
+          echo "[Ravelin] Cleaning firewall rules..."
+          ipset flush sentinel_block 2>/dev/null || true
+          ipset destroy sentinel_block 2>/dev/null || true
+          iptables -D INPUT -m set --match-set sentinel_block src -j DROP 2>/dev/null || true
+          iptables -D DOCKER-USER -m set --match-set sentinel_block src -j DROP 2>/dev/null || true
+
+          echo "[Ravelin] Uninstalled."
+          UNINSTALL
+          chmod +x "$pkg/uninstall.sh"
+
+          tar -C dist -czf "dist/ravelin-${version}-linux-x86_64.tar.gz" "ravelin-${version}-linux-x86_64"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ravelin-linux-x86_64
+          path: dist/ravelin-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: ${{ github.ref_name }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Create or update release
+        shell: bash
+        run: |
+          git log -1 --format=%b > release-notes.txt
+          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" --repo "$REPOSITORY" --notes-file release-notes.txt
+            gh release upload "$TAG_NAME" dist/* --clobber --repo "$REPOSITORY"
+          else
+            gh release create "$TAG_NAME" dist/* \
+              --repo "$REPOSITORY" \
+              --title "Ravelin $TAG_NAME" \
+              --notes-file release-notes.txt
+          fi
