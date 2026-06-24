@@ -1,102 +1,73 @@
+# RAVELIN
+
 <p align="center">
   <img src="https://github.com/user-attachments/assets/79098cb5-af7a-4343-9469-53d6d220410a" width="29%" alt="RAVELIN Logo by Ali Abdi">
 </p>
 
 **RAVELIN** *(French “[ravelin](https://en.wikipedia.org/wiki/Ravelin)”, an outer defensive fortification)*: **R**ust-powered **A**daptive **V**igilance & **E**nforcement — **L**ayered **I**ntelligent **I**nterceptor **N**ode
 
-A real-time, terminal-based intrusion prevention system (IPS) that monitors system logs, visualizes threats, and actively manages network blocks using `ipset`.
+RAVELIN is a real-time Linux VPS protection TUI/backbone. It reads Suricata `eve.json`, tracks short per-IP behavior windows, visualizes suspicious traffic, and manages `ipset` blocks with bounded memory use.
 
-## Prerequisites
+It uses request and response metadata, including HTTP status codes, so isolated failures are not treated the same as bursty, repetitive, or IDS-confirmed attack behavior.
 
-Ravelin relies on system-level tools for log generation and firewall management.
+## What It Does
+
+- Processes Suricata alerts and HTTP request/response metadata from `/var/log/suricata/eve.json`.
+- Keeps bounded in-memory state: short UI logs, short suspect detail history, compact dedupe hashes, and compact HTTP behavior windows.
+- Scores IDS alerts, HTTP error bursts, high-volume success bursts, and predictable request cadence.
+- Avoids blocking local, private, already-blocked, and trusted IPs.
+- Auto-blocks only after learning mode and only when score, event count, and high-confidence requirements are met.
+
+## Safety Model
+
+RAVELIN treats Suricata as the packet sensor and the Rust engine as the decision layer. Successful sparse traffic, webhook retries, and occasional errors are tracked but not immediately punished. Automated blocking requires repeated evidence and high-confidence signals, reducing the risk of blocking legitimate services such as Cloudflare, Telegram, or other upstream providers.
+
+## Install
 
 ```shell
-# 1. Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# 2. Install Dependencies (Debian/Ubuntu)
-# libsqlite3-dev: Database
-# suricata: IDS/Log generation
-# ipset: Blocking mechanism
-# tmux: Background session management
-sudo apt update && sudo apt install -y build-essential libsqlite3-dev suricata ipset tmux
-```
-
-## Build
-
-```shell
+source "$HOME/.cargo/env"
+sudo apt update
+sudo apt install -y build-essential libsqlite3-dev suricata ipset iproute2
 cargo build --release
 ```
 
-## Deployment
-
-Ravelin must run with `sudo` permissions to modify firewall rules and read system logs. Use `tmux` to keep the process running in the background.
+## Run
 
 ```shell
-# Create session, rename it, and run the binary
-tmux new -s ravelin
+# TUI only; protection backbone should be managed separately.
 sudo ./target/release/ravelin
+
+# Backbone only; stop with systemctl/SIGTERM, not the TUI.
+sudo ./target/release/ravelin daemon
+
+# TUI and backbone in one foreground process.
+sudo ./target/release/ravelin standalone
 ```
 
-## Controls
+Useful environment variable:
 
-| Key | Action |
-| :--- | :--- |
-| **TAB** | Switch between Suspects and Blocked lists |
-| **j / k** | Navigate Up/Down |
-| **h / l** | Scroll Details Left/Right |
-| **Enter** | Block Suspect / Unblock IP |
-| **i** | Inspect detailed history for selected IP |
-| **/** | Search/Filter Suspects |
-| **:** | Command Mode (e.g., `:clearlogs`, `:whitelist <ip>`) |
-| **q** | Quit |
-
----
-
-### ⚙️ Code Configuration Guide
-
-Based on the `main.rs` provided, here are the specific sections you may need to modify to fit your specific server environment or operational needs.
-
-#### 1. Operational Configuration
-
-These constants control the behavior of the application.
-
-```rust
-const DB_URL: &str = "sqlite://ravelin.db?mode=rwc";
-const LEARNING_PERIOD_HOURS: i64 = 12; // Time before auto-blocking/strict mode begins
-const LOG_CAP: usize = 100;            // Max lines in the "Live Feed" window
-const HISTORY_CAP: usize = 500;        // Max raw log lines stored per IP (for Inspect mode)
+```shell
+export RAVELIN_TRUSTED_IPS="203.0.113.10,198.51.100.20"
 ```
 
-#### 2. Log Paths
+## TUI Controls
 
-In `fn harvest_logs`, check that these paths match your Linux distribution:
-*   **Suricata:** Defaults to `/var/log/suricata/eve.json`.
-*   **SSH:** Defaults to checking `/var/log/auth.log` (Debian/Ubuntu) or `/var/log/secure` (RHEL/CentOS).
-*   **Docker:** Automatically grabs logs from running containers.
+| Key / Command | Action |
+| --- | --- |
+| `q`, `Esc` | Exit TUI gracefully |
+| `Tab` | Switch suspects/blocked panes |
+| `j`, `k` | Move selection |
+| `Enter` | Block selected suspect or unblock selected IP |
+| `i` | Inspect selected suspect |
+| `/text` | Filter suspects |
+| `:block <ip>` | Manually block IP |
+| `:unblock <ip>` | Unblock IP |
+| `:whitelist <ip>` | Trust IP for current run |
+| `:clearlogs` | Clear TUI log pane |
 
-#### 3. Log Parsing Regex
-If you use a non-standard SSH port, a different web server (Nginx vs Apache), or a specific log format, you may need to tweak these Regex patterns:
+## Notes
 
-```rust
-// Matches standard SSH login success
-static ref RE_SSH_SUCCESS: Regex = ...
-// Matches SSH failures (Brute force attempts)
-static ref RE_SSH_FAIL: Regex = ...
-// Matches HTTP 400/500 errors (Web scanning/fuzzing)
-static ref RE_HTTP_ERROR: Regex = ...
-```
-
-#### 4. Blocking Logic
-
-The `block_ip` function uses `ipset` and `iptables`.
-*   If your system uses `nftables` natively or `ufw` (Uncomplicated Firewall), you may need to change the `Command::new("sudo")` arguments to use those tools instead of `ipset`.
-
-#### 5. Whitelisting
-
-To prevent locking yourself out, you can manually whitelist your IP in the UI command mode:
-
-```text
-:whitelist 192.168.1.50
-```
+- RAVELIN writes `ravelin.db` locally and restores persisted blocks on startup.
+- The installer self-check configures `ipset`, `iptables`, and Suricata log rotation.
+- If your services sit behind Cloudflare or another proxy, configure Suricata/reverse-proxy logging so the real client IP is visible before enabling automated blocking.
