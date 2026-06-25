@@ -17,6 +17,13 @@ pub const AUTO_BLOCK_SCORE_THRESHOLD: u32 = 100;
 // Minimum events from one IP before auto-block eligibility.
 pub const MIN_AUTO_BLOCK_EVENTS: u32 = 5;
 
+// Score per known-vulnerable path hit (.env, .git/config, phpinfo, etc.).
+pub const SCANNER_PATH_SCORE: u32 = 50;
+// Unique scanner paths before immediate auto-block.
+pub const SCANNER_AUTO_BLOCK_THRESHOLD: usize = 10;
+// Max IPs tracked for path scanner detection.
+pub const SCANNER_IP_CAP: usize = 512;
+
 // Points added per SSH auth failure.
 pub const SSH_FAILURE_SCORE: u32 = 10;
 // Points added per Suricata IDS alert.

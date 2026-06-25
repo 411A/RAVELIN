@@ -8,13 +8,15 @@ use crate::{
         HTTP_ERROR_BURST_MIN_ERRORS, HTTP_ERROR_BURST_SCORE, HTTP_NO_SUCCESS_FLOOD_MIN_REQUESTS,
         HTTP_NO_SUCCESS_FLOOD_SCORE, HTTP_REGULAR_MAX_AVG_GAP_MS, HTTP_REGULAR_MAX_JITTER_MS,
         HTTP_REGULAR_MIN_AVG_GAP_MS, HTTP_REGULAR_MIN_REQUESTS, HTTP_SUCCESS_BURST_MIN_REQUESTS,
-        HTTP_SUCCESS_BURST_SCORE, MIN_AUTO_BLOCK_EVENTS, SUSPECT_CAP,
+        HTTP_SUCCESS_BURST_SCORE, MIN_AUTO_BLOCK_EVENTS, SCANNER_AUTO_BLOCK_THRESHOLD,
+        SCANNER_PATH_SCORE, SUSPECT_CAP,
     },
     models::{AppState, AutoBlock, HttpBehaviorSnapshot, Suspect},
     network::is_blockable_ip,
-    parser::{HttpSignal, SignalConfidence, SuspectSignal, parse_log_line},
+    parser::{HttpSignal, SignalConfidence, SuspectSignal, is_scanner_url, parse_log_line},
 };
 
+#[allow(clippy::too_many_lines)]
 pub async fn process_log_line(
     line: &str,
     source: &str,
@@ -32,6 +34,66 @@ pub async fn process_log_line(
 
     let mut app = state.lock().await;
     if !app.remember_event(source, line) {
+        return None;
+    }
+
+    if let Some(http) = &signal.http
+        && http.status == 404
+        && is_scanner_url(&http.url)
+        && !app.local_ips.contains(&http.ip)
+        && !app.whitelisted_dynamic.contains(&http.ip)
+        && !app.is_blocked(&http.ip)
+        && is_blockable_ip(&http.ip)
+    {
+        let count = app.record_scanner_path(&http.ip, &http.url);
+        app.push_log(&format!(
+            "🛡️ [Scanner] {} probed {} ({count} unique paths)",
+            http.ip, http.url
+        ));
+        let score = u32::try_from(count).unwrap_or(u32::MAX) * SCANNER_PATH_SCORE;
+        if count >= SCANNER_AUTO_BLOCK_THRESHOLD {
+            let reason = format!(
+                "Path scanner: {count} unique vulnerable paths probed ({})",
+                http.url
+            );
+            app.push_history(&http.ip, &format!("[{source}] {line}"));
+            drop(app);
+            return Some(AutoBlock {
+                ip: http.ip.clone(),
+                reason,
+            });
+        }
+        let now = Utc::now();
+        if let Some(existing) = app.suspects.iter_mut().find(|s| s.ip == http.ip) {
+            existing.score = existing.score.saturating_add(SCANNER_PATH_SCORE);
+            existing.events = existing.events.saturating_add(1);
+            existing.last_seen = now;
+            existing.reason = format!("Path scanner: {count} unique vulnerable paths");
+            "Scanner".clone_into(&mut existing.source_type);
+            existing.auto_block_eligible = auto_block_eligible(existing);
+        } else {
+            app.suspects.push(Suspect {
+                ip: http.ip.clone(),
+                reason: format!("Path scanner: {count} unique vulnerable paths"),
+                score,
+                events: 1,
+                first_seen: now,
+                last_seen: now,
+                source_type: "Scanner".to_owned(),
+                auto_block_eligible: false,
+            });
+        }
+        app.suspects.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.last_seen.cmp(&a.last_seen))
+        });
+        if app.suspects.len() > SUSPECT_CAP {
+            app.suspects.truncate(SUSPECT_CAP);
+        }
+        app.clamp_selected_indexes();
+        app.push_history(&http.ip, &format!("[{source}] {line}"));
+        drop(app);
         return None;
     }
 

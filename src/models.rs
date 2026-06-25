@@ -55,6 +55,8 @@ pub struct AppState {
     recent_event_set: HashSet<u64>,
     ip_history_order: VecDeque<String>,
     http_behavior_order: VecDeque<String>,
+    pub scanner_urls: HashMap<String, HashSet<String>>,
+    scanner_order: VecDeque<String>,
 }
 
 impl AppState {
@@ -89,6 +91,8 @@ impl AppState {
             recent_event_set: HashSet::new(),
             ip_history_order: VecDeque::new(),
             http_behavior_order: VecDeque::new(),
+            scanner_urls: HashMap::new(),
+            scanner_order: VecDeque::new(),
         }
     }
 
@@ -170,6 +174,27 @@ impl AppState {
 
     pub fn is_blocked(&self, ip: &str) -> bool {
         self.blocked.iter().any(|blocked| blocked.ip == ip)
+    }
+
+    pub fn record_scanner_path(&mut self, ip: &str, url: &str) -> usize {
+        let is_new_ip = !self.scanner_urls.contains_key(ip);
+        if is_new_ip {
+            self.scanner_order.push_back(ip.to_owned());
+        }
+
+        let count = {
+            let urls = self.scanner_urls.entry(ip.to_owned()).or_default();
+            urls.insert(url.to_owned());
+            urls.len()
+        };
+
+        while self.scanner_urls.len() > crate::constants::SCANNER_IP_CAP {
+            if let Some(oldest) = self.scanner_order.pop_front() {
+                self.scanner_urls.remove(&oldest);
+            }
+        }
+
+        count
     }
 
     pub fn clamp_selected_indexes(&mut self) {

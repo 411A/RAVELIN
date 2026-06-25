@@ -4,6 +4,64 @@ use std::sync::LazyLock;
 
 use crate::{constants::MAX_REASON_LEN, network::normalize_ipv4};
 
+const SCANNER_PATTERNS: &[&str] = &[
+    ".env",
+    ".git/config",
+    ".git/HEAD",
+    "phpinfo",
+    "wp-config",
+    ".bak",
+    ".swp",
+    ".old",
+    ".orig",
+    ".copy",
+    ".save",
+    "credentials",
+    "aws_credentials",
+    "azure-credentials",
+    "sendgrid_keys",
+    "debug.log",
+    "error.log",
+    "laravel.log",
+    "web.config",
+    ".ssh/",
+    ".aws/",
+    ".kube/",
+    "docker-compose",
+    "id_rsa",
+    ".dockerenv",
+    "backup.sql",
+    "dump.sql",
+    "database.sql",
+    ".svn/entries",
+    "WEB-INF/web.xml",
+    "actuator",
+    "phpinfo.php",
+    "phpminiadmin",
+    "pinfo.php",
+    "dbadmin.php",
+    "sqladmin.php",
+    "s3cfg",
+    ".s3cfg",
+    "jenkins",
+    "hudson.tasks",
+    ".circleci",
+    ".gitlab-ci",
+    "terraform.tfstate",
+    "composer.lock",
+    "package.json",
+    "serverless.yml",
+    "swagger",
+    "elmah.axd",
+    "trace.axd",
+    "debugbar",
+    "_profiler",
+    ".well-known/acme",
+    "config.php.bak",
+    "settings.php.bak",
+    "login.php.bak",
+];
+
 static RE_SSH_SUCCESS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"Accepted (?:publickey|password) for .* from (\d+\.\d+\.\d+\.\d+)")
         .expect("valid SSH success regex")
@@ -272,6 +330,13 @@ const fn http_status_score(status: u16) -> u32 {
     } else {
         crate::constants::HTTP_CLIENT_ERROR_SCORE
     }
+}
+
+pub fn is_scanner_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    SCANNER_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
 }
 
 fn trim_reason(reason: String) -> String {
