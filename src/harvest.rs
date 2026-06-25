@@ -12,7 +12,9 @@ use tokio::{
 
 use crate::{
     actions,
-    constants::{SURICATA_EVE_PATH, SURICATA_MAX_LINES_PER_POLL, SURICATA_POLL_SECS},
+    constants::{
+        SURICATA_EVE_PATH, SURICATA_MAX_LINES_PER_POLL, SURICATA_POLL_SECS, SYSLOG_POLL_SECS,
+    },
     engine::process_log_line,
     models::AppState,
 };
@@ -22,6 +24,16 @@ pub fn start_harvesters(
     pool: Pool<Sqlite>,
     shutdown: watch::Receiver<bool>,
 ) {
+    {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            state
+                .lock()
+                .await
+                .push_log(&format!("ℹ️ [Suricata] monitoring {SURICATA_EVE_PATH}"));
+        });
+    }
+
     tokio::spawn(follow_file(
         FileFollower {
             path: SURICATA_EVE_PATH,
@@ -29,6 +41,7 @@ pub fn start_harvesters(
             interval: Duration::from_secs(SURICATA_POLL_SECS),
             lightweight_suricata_filter: true,
             max_lines: SURICATA_MAX_LINES_PER_POLL,
+            read_from_start: true,
         },
         app_state.clone(),
         pool.clone(),
@@ -40,7 +53,20 @@ pub fn start_harvesters(
         pool.clone(),
         shutdown.clone(),
     ));
-    tokio::spawn(follow_docker(app_state, pool, shutdown));
+    tokio::spawn(follow_docker(
+        app_state.clone(),
+        pool.clone(),
+        shutdown.clone(),
+    ));
+    tokio::spawn(follow_syslog(app_state.clone(), pool, shutdown));
+    {
+        let state = app_state;
+        tokio::spawn(async move {
+            state.lock().await.push_log(
+                "ℹ️ [Core] all harvesters started — watching SSH, Docker, Syslog, Suricata",
+            );
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +76,7 @@ struct FileFollower {
     interval: Duration,
     lightweight_suricata_filter: bool,
     max_lines: usize,
+    read_from_start: bool,
 }
 
 async fn follow_file(
@@ -58,8 +85,8 @@ async fn follow_file(
     pool: Pool<Sqlite>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut position = 0;
-    let mut initialized = false;
+    let mut position: u64 = 0;
+    let mut initialized = config.read_from_start;
     let mut missing_log_reported = false;
 
     loop {
@@ -93,7 +120,7 @@ async fn follow_file(
                         push_harvest_status(
                             &app_state,
                             config.source,
-                            &format!("waiting for {} to be created by Suricata", config.path),
+                            &format!("waiting for {} to be created", config.path),
                         )
                         .await;
                         missing_log_reported = true;
@@ -213,7 +240,7 @@ async fn follow_ssh(
     };
 
     let mut position: u64 = 0;
-    let mut initialized = false;
+    let mut initialized = true;
     let mut missing_log_reported = false;
 
     loop {
@@ -322,6 +349,81 @@ async fn follow_docker(
         }
 
         if sleep_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
+            return;
+        }
+    }
+}
+
+async fn follow_syslog(
+    app_state: Arc<Mutex<AppState>>,
+    pool: Pool<Sqlite>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let path = if Path::new("/var/log/syslog").exists() {
+        "/var/log/syslog"
+    } else if Path::new("/var/log/messages").exists() {
+        "/var/log/messages"
+    } else {
+        push_harvest_status(&app_state, "Syslog", "no syslog file found; skipping").await;
+        return;
+    };
+
+    let mut position: u64 = 0;
+    let mut initialized = true;
+    let mut missing_log_reported = false;
+
+    loop {
+        match read_new_lines(
+            path,
+            &mut position,
+            &mut initialized,
+            false,
+            SURICATA_MAX_LINES_PER_POLL,
+        )
+        .await
+        {
+            Ok(lines) => {
+                if missing_log_reported {
+                    push_harvest_status(
+                        &app_state,
+                        "Syslog",
+                        &format!("{path} is available; live harvesting resumed"),
+                    )
+                    .await;
+                    missing_log_reported = false;
+                }
+                for line in &lines {
+                    if line.contains("Failed password")
+                        || line.contains("Invalid user")
+                        || line.contains("authentication failure")
+                        || line.contains("session opened")
+                        || line.contains("session closed")
+                        || line.contains("segfault")
+                        || line.contains("oom-killer")
+                        || line.contains("blocked")
+                    {
+                        handle_line(line, "Syslog", &app_state, &pool).await;
+                    }
+                }
+            }
+            Err(error) => {
+                if is_not_found(&error) {
+                    if !missing_log_reported {
+                        push_harvest_status(
+                            &app_state,
+                            "Syslog",
+                            &format!("waiting for {path} to be created"),
+                        )
+                        .await;
+                        missing_log_reported = true;
+                    }
+                } else {
+                    push_harvest_error(&app_state, "Syslog", &error).await;
+                }
+            }
+        }
+
+        if sleep_or_shutdown(Duration::from_secs(SYSLOG_POLL_SECS), &mut shutdown).await {
             return;
         }
     }

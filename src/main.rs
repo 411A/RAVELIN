@@ -41,7 +41,8 @@ async fn main() -> Result<()> {
         println!("Ensuring Ravelin dependencies, firewall rules, and database are ready...");
         firewall::system_self_check()?;
     } else {
-        println!("Opening local TUI. Start protection with: sudo systemctl start ravelin");
+        println!("Opening local TUI...");
+        println!("Start protection with: sudo systemctl start ravelin");
     }
 
     let pool = db::init_db().await?;

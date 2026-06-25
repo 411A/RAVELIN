@@ -36,6 +36,7 @@ pub const HTTP_REGULAR_MAX_JITTER_MS: i64 = 250;
 pub const EVENT_POLL_INTERVAL_MS: u64 = 100;
 pub const SURICATA_POLL_SECS: u64 = 2;
 pub const SURICATA_MAX_LINES_PER_POLL: usize = 1_000;
+pub const SYSLOG_POLL_SECS: u64 = 5;
 
 pub const SURICATA_EVE_PATH: &str = "/var/log/suricata/eve.json";
 

@@ -200,7 +200,6 @@ fn process_suspect_signal(
     if app.local_ips.contains(&suspect.ip)
         || app.whitelisted_dynamic.contains(&suspect.ip)
         || app.is_blocked(&suspect.ip)
-        || !is_blockable_ip(&suspect.ip)
     {
         return None;
     }
@@ -261,6 +260,10 @@ fn process_suspect_signal(
         app.suspects.truncate(SUSPECT_CAP);
     }
     app.clamp_selected_indexes();
+
+    if !is_blockable_ip(&suspect.ip) {
+        return None;
+    }
 
     if suspect.immediate_block {
         return Some(AutoBlock {

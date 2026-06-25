@@ -75,7 +75,7 @@ jobs:
           cat > "$pkg/ravelin.service" <<'UNIT'
           [Unit]
           Description=Ravelin - Suricata-backed intruder detection
-          After=network-online.target suricata.service
+          After=network-online.target
           Wants=network-online.target
 
           [Service]
@@ -171,11 +171,75 @@ jobs:
           }
           LOGROTATE
 
+          echo "[Ravelin] Configuring Suricata..."
+          IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+          if [ -z "$IFACE" ]; then
+            IFACE=$(ip -o -4 addr show up 2>/dev/null | awk '!/127.0.0.1/ {print $2; exit}')
+          fi
+          if [ -n "$IFACE" ]; then
+            echo "[Ravelin] Detected interface: $IFACE"
+            mkdir -p /etc/suricata
+            cat > /etc/suricata/ravelin.yaml <<YAML
+          %YAML 1.1
+          ---
+          vars:
+            address-groups:
+              HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]"
+              EXTERNAL_NET: "!HOME_NET"
+
+          default-log-dir: /var/log/suricata/
+
+          outputs:
+            - eve-log:
+                enabled: yes
+                filetype: regular
+                filename: eve.json
+                types:
+                  - alert
+                  - http
+                  - dns
+                  - tls
+                  - flow
+                  - netflow
+
+          af-packet:
+            - interface: $IFACE
+              cluster-id: 99
+              cluster-type: cluster_flow
+              defrag: yes
+          YAML
+          fi
+
+          echo "[Ravelin] Updating Suricata rules..."
+          if command -v suricata-update >/dev/null 2>&1; then
+            suricata-update --no-test 2>/dev/null || true
+          fi
+
+          echo "[Ravelin] Creating Suricata log directory..."
+          mkdir -p /var/log/suricata
+          chown -R suricata:suricata /var/log/suricata 2>/dev/null || true
+
+          echo "[Ravelin] Starting Suricata..."
+          if systemctl list-unit-files | grep -q suricata.service; then
+            systemctl enable suricata 2>/dev/null || true
+            systemctl restart suricata 2>/dev/null || true
+          fi
+
           echo ""
-          echo "[Ravelin] Installed. Start protection:  sudo systemctl start ravelin"
-          echo "[Ravelin] Open TUI:                  ravelin"
-          echo "[Ravelin] Foreground all-in-one:     sudo ravelin standalone"
-          echo "[Ravelin] View logs:              journalctl -u ravelin -f"
+          echo "[Ravelin] Installed."
+          echo ""
+          echo "  Start protection:"
+          echo "    sudo systemctl start ravelin"
+          echo ""
+          echo "  Open TUI:"
+          echo "    ravelin"
+          echo ""
+          echo "  All-in-one:"
+          echo "    sudo ravelin standalone"
+          echo ""
+          echo "  View logs:"
+          echo "    sudo journalctl -u ravelin -f"
+          echo ""
           INSTALL
           chmod +x "$pkg/install.sh"
 
