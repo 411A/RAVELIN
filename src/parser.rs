@@ -2,65 +2,10 @@ use regex::Regex;
 use serde_json::Value;
 use std::sync::LazyLock;
 
-use crate::{constants::MAX_REASON_LEN, network::normalize_ipv4};
-
-const SCANNER_PATTERNS: &[&str] = &[
-    ".env",
-    ".git/config",
-    ".git/HEAD",
-    "phpinfo",
-    "wp-config",
-    ".bak",
-    ".swp",
-    ".old",
-    ".orig",
-    ".copy",
-    ".save",
-    "credentials",
-    "aws_credentials",
-    "azure-credentials",
-    "sendgrid_keys",
-    "debug.log",
-    "error.log",
-    "laravel.log",
-    "web.config",
-    ".ssh/",
-    ".aws/",
-    ".kube/",
-    "docker-compose",
-    "id_rsa",
-    ".dockerenv",
-    "backup.sql",
-    "dump.sql",
-    "database.sql",
-    ".svn/entries",
-    "WEB-INF/web.xml",
-    "actuator",
-    "phpinfo.php",
-    "phpminiadmin",
-    "pinfo.php",
-    "dbadmin.php",
-    "sqladmin.php",
-    "s3cfg",
-    ".s3cfg",
-    "jenkins",
-    "hudson.tasks",
-    ".circleci",
-    ".gitlab-ci",
-    "terraform.tfstate",
-    "composer.lock",
-    "package.json",
-    "serverless.yml",
-    "swagger",
-    "elmah.axd",
-    "trace.axd",
-    "debugbar",
-    "_profiler",
-    ".well-known/acme",
-    "config.php.bak",
-    "settings.php.bak",
-    "login.php.bak",
-];
+use crate::{
+    constants::{MAX_REASON_LEN, SCANNER_PATTERNS},
+    network::normalize_ipv4,
+};
 
 static RE_SSH_SUCCESS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"Accepted (?:publickey|password) for .* from (\d+\.\d+\.\d+\.\d+)")
@@ -71,11 +16,15 @@ static RE_SSH_FAIL: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid SSH failure regex")
 });
 static RE_HTTP_ERROR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(\d+\.\d+\.\d+\.\d+) - - \[.*?\] ".*?" ([45]\d{2})"#)
-        .expect("valid HTTP access-log error regex")
+    Regex::new(r#"(\d+\.\d+\.\d+\.\d+) - - \[.*?\] ".*?" ([4]\d{2})"#)
+        .expect("valid HTTP access-log client-error regex")
 });
 static RE_IPV4: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+\.\d+\.\d+\.\d+)").expect("valid IPv4 regex"));
+static RE_APP_ACCESS_LOG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\d+\.\d+\.\d+\.\d+):\d+ - "(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH) ([^"]+) HTTP/[\d.]+" (\d{3})"#)
+        .expect("valid app access-log regex")
+});
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogSignal {
@@ -158,6 +107,38 @@ pub fn parse_log_line(line: &str, source: &str) -> LogSignal {
             score_delta: http_error_score(status),
             confidence: SignalConfidence::Low,
             immediate_block: false,
+        });
+        return signal;
+    }
+
+    if source.starts_with("Docker")
+        && let Some(captures) = RE_APP_ACCESS_LOG.captures(line)
+        && let Some(ip) = captures
+            .get(1)
+            .and_then(|matched| normalize_ipv4(matched.as_str()))
+    {
+        let method = captures.get(2).map_or("GET", |m| m.as_str()).to_owned();
+        let url = captures.get(3).map_or("/", |m| m.as_str()).to_owned();
+        let status: u16 = captures
+            .get(4)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        push_unique_ip(&mut signal.ips_found, ip.clone());
+        if (400..500).contains(&status) {
+            signal.suspect = Some(SuspectSignal {
+                ip: ip.clone(),
+                reason: format!("HTTP {status} Error"),
+                score_delta: http_error_score(&status.to_string()),
+                confidence: SignalConfidence::Low,
+                immediate_block: false,
+            });
+        }
+        signal.http = Some(HttpSignal {
+            ip,
+            status,
+            method,
+            host: String::new(),
+            url,
         });
         return signal;
     }

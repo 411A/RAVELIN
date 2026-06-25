@@ -38,7 +38,8 @@ pub async fn process_log_line(
     }
 
     if let Some(http) = &signal.http
-        && http.status == 404
+        && http.status >= 400
+        && http.status < 500
         && is_scanner_url(&http.url)
         && !app.local_ips.contains(&http.ip)
         && !app.whitelisted_dynamic.contains(&http.ip)
