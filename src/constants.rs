@@ -6,7 +6,6 @@ pub const RECENT_EVENT_CAP: usize = 20_000;
 pub const SUSPECT_CAP: usize = 1_000;
 pub const AUTO_BLOCK_SCORE_THRESHOLD: u32 = 100;
 pub const MIN_AUTO_BLOCK_EVENTS: u32 = 5;
-pub const MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS: u32 = 3;
 pub const SSH_FAILURE_SCORE: u32 = 10;
 pub const IDS_ALERT_SCORE: u32 = 25;
 pub const HTTP_CLIENT_ERROR_SCORE: u32 = 2;

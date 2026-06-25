@@ -15,7 +15,6 @@ pub struct Suspect {
     pub reason: String,
     pub score: u32,
     pub events: u32,
-    pub high_confidence_events: u32,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub source_type: String,

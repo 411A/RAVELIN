@@ -8,8 +8,7 @@ use crate::{
         HTTP_ERROR_BURST_MIN_ERRORS, HTTP_ERROR_BURST_SCORE, HTTP_NO_SUCCESS_FLOOD_MIN_REQUESTS,
         HTTP_NO_SUCCESS_FLOOD_SCORE, HTTP_REGULAR_MAX_AVG_GAP_MS, HTTP_REGULAR_MAX_JITTER_MS,
         HTTP_REGULAR_MIN_AVG_GAP_MS, HTTP_REGULAR_MIN_REQUESTS, HTTP_SUCCESS_BURST_MIN_REQUESTS,
-        HTTP_SUCCESS_BURST_SCORE, MIN_AUTO_BLOCK_EVENTS, MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS,
-        SUSPECT_CAP,
+        HTTP_SUCCESS_BURST_SCORE, MIN_AUTO_BLOCK_EVENTS, SUSPECT_CAP,
     },
     models::{AppState, AutoBlock, HttpBehaviorSnapshot, Suspect},
     network::is_blockable_ip,
@@ -217,22 +216,17 @@ fn process_suspect_signal(
     {
         existing.score = existing.score.saturating_add(suspect.score_delta);
         existing.events = existing.events.saturating_add(1);
-        if suspect.confidence == SignalConfidence::High {
-            existing.high_confidence_events = existing.high_confidence_events.saturating_add(1);
-        }
         existing.last_seen = now;
         existing.reason.clone_from(&suspect.reason);
         source.clone_into(&mut existing.source_type);
         existing.auto_block_eligible = auto_block_eligible(existing);
         existing.score
     } else {
-        let high_confidence_events = u32::from(suspect.confidence == SignalConfidence::High);
         app.suspects.push(Suspect {
             ip: suspect.ip.clone(),
             reason: suspect.reason.clone(),
             score: suspect.score_delta,
             events: 1,
-            high_confidence_events,
             first_seen: now,
             last_seen: now,
             source_type: source.to_owned(),
@@ -296,7 +290,6 @@ fn process_suspect_signal(
 
 const fn auto_block_eligible(suspect: &Suspect) -> bool {
     suspect.events >= MIN_AUTO_BLOCK_EVENTS
-        && suspect.high_confidence_events >= MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS
 }
 
 #[cfg(test)]
