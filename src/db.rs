@@ -1,14 +1,40 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Pool, Row, Sqlite, sqlite::SqlitePoolOptions};
+use std::env;
 
 use crate::{constants::DB_URL, models::BlockedIp};
 
+fn resolve_db_url() -> String {
+    if running_as_root() {
+        let dir = "/var/lib/ravelin";
+        let _ = std::fs::create_dir_all(dir);
+        format!("sqlite:{dir}/ravelin.db?mode=rwc")
+    } else if let Ok(home) = env::var("HOME") {
+        let dir = format!("{home}/.ravelin");
+        let _ = std::fs::create_dir_all(&dir);
+        format!("sqlite:{dir}/ravelin.db?mode=rwc")
+    } else {
+        DB_URL.to_owned()
+    }
+}
+
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|uid| uid.trim() == "0")
+}
+
 pub async fn init_db() -> Result<Pool<Sqlite>> {
+    let db_url = resolve_db_url();
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(DB_URL)
-        .await?;
+        .connect(&db_url)
+        .await
+        .with_context(|| format!("failed to open database at {db_url}"))?;
 
     sqlx::query("PRAGMA journal_mode = WAL")
         .execute(&pool)

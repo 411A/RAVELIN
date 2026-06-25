@@ -1,9 +1,10 @@
 use anyhow::Result;
 use sqlx::{Pool, Sqlite};
-use std::{io::SeekFrom, sync::Arc};
+use std::{io::SeekFrom, path::Path, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncSeekExt, BufReader},
+    process::Command,
     sync::Mutex,
     sync::watch,
     time::{self, Duration},
@@ -29,10 +30,17 @@ pub fn start_harvesters(
             lightweight_suricata_filter: true,
             max_lines: SURICATA_MAX_LINES_PER_POLL,
         },
-        app_state,
-        pool,
-        shutdown,
+        app_state.clone(),
+        pool.clone(),
+        shutdown.clone(),
     ));
+
+    tokio::spawn(follow_ssh(
+        app_state.clone(),
+        pool.clone(),
+        shutdown.clone(),
+    ));
+    tokio::spawn(follow_docker(app_state, pool, shutdown));
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +198,132 @@ async fn sleep_or_shutdown(interval: Duration, shutdown: &mut watch::Receiver<bo
     tokio::select! {
         () = time::sleep(interval) => false,
         changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
+    }
+}
+
+async fn follow_ssh(
+    app_state: Arc<Mutex<AppState>>,
+    pool: Pool<Sqlite>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let path = if Path::new("/var/log/auth.log").exists() {
+        "/var/log/auth.log"
+    } else {
+        "/var/log/secure"
+    };
+
+    let mut position: u64 = 0;
+    let mut initialized = false;
+    let mut missing_log_reported = false;
+
+    loop {
+        match read_new_lines(
+            path,
+            &mut position,
+            &mut initialized,
+            false,
+            SURICATA_MAX_LINES_PER_POLL,
+        )
+        .await
+        {
+            Ok(lines) => {
+                if missing_log_reported {
+                    push_harvest_status(
+                        &app_state,
+                        "SSH",
+                        &format!("{path} is available; live harvesting resumed"),
+                    )
+                    .await;
+                    missing_log_reported = false;
+                }
+                for line in &lines {
+                    if line.contains("Failed password")
+                        || line.contains("Invalid user")
+                        || line.contains("Disconnected from authenticating user")
+                        || line.contains("Accepted")
+                    {
+                        handle_line(line, "SSH", &app_state, &pool).await;
+                    }
+                }
+            }
+            Err(error) => {
+                if is_not_found(&error) {
+                    if !missing_log_reported {
+                        push_harvest_status(
+                            &app_state,
+                            "SSH",
+                            &format!("waiting for {path} to be created"),
+                        )
+                        .await;
+                        missing_log_reported = true;
+                    }
+                } else {
+                    push_harvest_error(&app_state, "SSH", &error).await;
+                }
+            }
+        }
+
+        if sleep_or_shutdown(Duration::from_secs(3), &mut shutdown).await {
+            return;
+        }
+    }
+}
+
+async fn follow_docker(
+    app_state: Arc<Mutex<AppState>>,
+    pool: Pool<Sqlite>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut missing_reported = false;
+
+    loop {
+        match Command::new("docker").arg("ps").arg("-q").output().await {
+            Ok(output) if output.status.success() => {
+                if missing_reported {
+                    push_harvest_status(
+                        &app_state,
+                        "Docker",
+                        "Docker is available; live harvesting resumed",
+                    )
+                    .await;
+                    missing_reported = false;
+                }
+                let ids = String::from_utf8_lossy(&output.stdout);
+                for id in ids.lines().filter(|l| !l.is_empty()) {
+                    if let Ok(logs) = Command::new("docker")
+                        .args(["logs", "--tail", "20", id])
+                        .output()
+                        .await
+                    {
+                        let log_str = String::from_utf8_lossy(&logs.stdout);
+                        for line in log_str.lines() {
+                            handle_line(
+                                line,
+                                &format!("Docker-{}", &id[..id.len().min(4)]),
+                                &app_state,
+                                &pool,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+            Ok(_) | Err(_) => {
+                if !missing_reported {
+                    push_harvest_status(
+                        &app_state,
+                        "Docker",
+                        "Docker not available; skipping container log harvesting",
+                    )
+                    .await;
+                    missing_reported = true;
+                }
+            }
+        }
+
+        if sleep_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
+            return;
+        }
     }
 }
 

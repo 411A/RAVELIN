@@ -255,6 +255,13 @@ fn suspect_list_item(index: usize, suspect: &Suspect) -> ListItem<'_> {
 fn handle_key_code(code: KeyCode, app: &mut AppState, list_visible_height: usize) -> UiAction {
     clamp_ui_selection(app);
     if code == KeyCode::Esc {
+        if app.detail_open {
+            app.detail_open = false;
+            app.detail_ip = None;
+            app.detail_scroll = 0;
+            app.detail_scroll_x = 0;
+            return UiAction::None;
+        }
         return UiAction::Quit;
     }
 

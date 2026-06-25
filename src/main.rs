@@ -102,7 +102,11 @@ fn build_app_state(
 }
 
 async fn run_tui(pool: sqlx::Pool<sqlx::Sqlite>, app_state: Arc<Mutex<AppState>>) -> Result<()> {
-    with_terminal(pool, app_state).await
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    harvest::start_harvesters(app_state.clone(), pool.clone(), shutdown_rx);
+    let result = with_terminal(pool, app_state).await;
+    let _ = shutdown_tx.send(true);
+    result
 }
 
 async fn run_standalone(
