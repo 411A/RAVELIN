@@ -221,6 +221,12 @@ fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
+fn is_permission_denied(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
 async fn sleep_or_shutdown(interval: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         () = time::sleep(interval) => false,
@@ -280,6 +286,18 @@ async fn follow_ssh(
                             &app_state,
                             "SSH",
                             &format!("waiting for {path} to be created"),
+                        )
+                        .await;
+                        missing_log_reported = true;
+                    }
+                } else if is_permission_denied(&error) {
+                    if !missing_log_reported {
+                        push_harvest_status(
+                            &app_state,
+                            "SSH",
+                            &format!(
+                                "permission denied reading {path} — add your user to the adm group: sudo usermod -aG adm $USER"
+                            ),
                         )
                         .await;
                         missing_log_reported = true;
@@ -413,6 +431,18 @@ async fn follow_syslog(
                             &app_state,
                             "Syslog",
                             &format!("waiting for {path} to be created"),
+                        )
+                        .await;
+                        missing_log_reported = true;
+                    }
+                } else if is_permission_denied(&error) {
+                    if !missing_log_reported {
+                        push_harvest_status(
+                            &app_state,
+                            "Syslog",
+                            &format!(
+                                "permission denied reading {path} — add your user to the adm group: sudo usermod -aG adm $USER"
+                            ),
                         )
                         .await;
                         missing_log_reported = true;

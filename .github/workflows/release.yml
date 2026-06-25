@@ -223,6 +223,18 @@ jobs:
           if systemctl list-unit-files | grep -q suricata.service; then
             systemctl enable suricata 2>/dev/null || true
             systemctl restart suricata 2>/dev/null || true
+            sleep 2
+            if systemctl is-active --quiet suricata; then
+              echo "[Ravelin] Suricata is running."
+            else
+              echo "[Ravelin] Warning: Suricata failed to start. Check: sudo journalctl -u suricata -n 20" >&2
+            fi
+          fi
+
+          echo "[Ravelin] Adding $SUDO_USER to adm group for log access..."
+          if [ -n "$SUDO_USER" ]; then
+            usermod -aG adm "$SUDO_USER" 2>/dev/null || true
+            echo "[Ravelin] Log out and back in for group changes to take effect."
           fi
 
           echo ""
