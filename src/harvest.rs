@@ -196,8 +196,24 @@ async fn handle_line(
         return;
     };
 
-    if let Err(error) = actions::block_ip(auto_block.ip, auto_block.reason, pool, app_state).await {
-        actions::push_action_error(app_state, "auto-block failed", &error).await;
+    match actions::block_ip(auto_block.ip, auto_block.reason, pool, app_state).await {
+        Ok(()) => {}
+        Err(error) => {
+            let msg = format!("{error}");
+            let is_perm = msg.contains("Operation not permitted")
+                || msg.contains("exit status")
+                || msg.contains("sudo");
+            if is_perm {
+                actions::push_action_error(
+                    app_state,
+                    "auto-block requires root — run: sudo ravelin standalone",
+                    &error,
+                )
+                .await;
+            } else {
+                actions::push_action_error(app_state, "auto-block failed", &error).await;
+            }
+        }
     }
 }
 

@@ -42,7 +42,11 @@ async fn main() -> Result<()> {
         firewall::system_self_check()?;
     } else {
         println!("Opening local TUI...");
-        println!("Start protection with: sudo systemctl start ravelin");
+        if !running_as_root() {
+            println!(
+                "NOTE: Auto-blocking requires root. Run 'sudo ravelin standalone' for full protection."
+            );
+        }
     }
 
     let pool = db::init_db().await?;
