@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     Frame, Terminal,
@@ -16,7 +15,7 @@ use tokio::sync::Mutex;
 use crate::{
     actions,
     constants::{
-        BACKBONE_SERVICE_NAME, EVENT_POLL_INTERVAL_MS, LEARNING_PERIOD_HOURS, MANUAL_BLOCK_REASON,
+        BACKBONE_SERVICE_NAME, EVENT_POLL_INTERVAL_MS, MANUAL_BLOCK_REASON,
         MAX_COMMAND_BUFFER_CHARS,
     },
     models::{ActiveWindow, AppState, InputMode, Suspect},
@@ -212,21 +211,11 @@ fn render_blocked(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn render_command_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let time_alive = Utc::now().signed_duration_since(app.start_time).num_hours();
-    let mode_text = if time_alive < LEARNING_PERIOD_HOURS {
-        format!(
-            "🛡️ LEARNING MODE ({}h remaining) - No Auto-Block",
-            LEARNING_PERIOD_HOURS - time_alive
-        )
-    } else {
-        "⚔️ ACTIVE DEFENSE MODE".to_owned()
-    };
-
     let input_text = if app.input_mode == InputMode::Command {
         app.input_buffer.clone()
     } else {
         format!(
-            "{} | {mode_text} | [TAB] Lists | [j/k] Move | [i] Inspect | [/] Search | [Esc/Q] Exit TUI | systemctl stop {BACKBONE_SERVICE_NAME} stops protection",
+            "{} | ⚔️ ACTIVE DEFENSE MODE | [TAB] Lists | [j/k] Move | [i] Inspect | [/] Search | [Esc/Q] Exit TUI | systemctl stop {BACKBONE_SERVICE_NAME} stops protection",
             app.runtime_mode.label()
         )
     };

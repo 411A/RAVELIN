@@ -1,5 +1,4 @@
 pub const DB_URL: &str = "sqlite://ravelin.db?mode=rwc";
-pub const LEARNING_PERIOD_HOURS: i64 = 12;
 pub const LOG_CAP: usize = 200;
 pub const HISTORY_CAP: usize = 32;
 pub const IP_HISTORY_KEY_CAP: usize = 512;

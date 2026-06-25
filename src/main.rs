@@ -45,7 +45,6 @@ async fn main() -> Result<()> {
     }
 
     let pool = db::init_db().await?;
-    let start_time = db::get_start_time(&pool).await?;
     let initial_blocked = db::load_blocked(&pool).await?;
 
     if runtime_mode.requires_privileged_setup() && !initial_blocked.is_empty() {
@@ -56,7 +55,7 @@ async fn main() -> Result<()> {
         firewall::restore_blocked_ips(initial_blocked.iter().map(|blocked| blocked.ip.as_str()))?;
     }
 
-    let app_state = build_app_state(initial_blocked, start_time, runtime_mode);
+    let app_state = build_app_state(initial_blocked, runtime_mode);
 
     match runtime_mode {
         RuntimeMode::Tui => run_tui(pool, app_state).await,
@@ -88,7 +87,6 @@ fn running_as_root() -> bool {
 
 fn build_app_state(
     initial_blocked: Vec<models::BlockedIp>,
-    start_time: chrono::DateTime<chrono::Utc>,
     runtime_mode: RuntimeMode,
 ) -> Arc<Mutex<AppState>> {
     let mut local_ips = get_local_ips();
@@ -96,7 +94,6 @@ fn build_app_state(
     Arc::new(Mutex::new(AppState::new(
         initial_blocked,
         local_ips,
-        start_time,
         runtime_mode,
     )))
 }

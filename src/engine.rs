@@ -8,8 +8,8 @@ use crate::{
         HTTP_ERROR_BURST_MIN_ERRORS, HTTP_ERROR_BURST_SCORE, HTTP_NO_SUCCESS_FLOOD_MIN_REQUESTS,
         HTTP_NO_SUCCESS_FLOOD_SCORE, HTTP_REGULAR_MAX_AVG_GAP_MS, HTTP_REGULAR_MAX_JITTER_MS,
         HTTP_REGULAR_MIN_AVG_GAP_MS, HTTP_REGULAR_MIN_REQUESTS, HTTP_SUCCESS_BURST_MIN_REQUESTS,
-        HTTP_SUCCESS_BURST_SCORE, LEARNING_PERIOD_HOURS, MIN_AUTO_BLOCK_EVENTS,
-        MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS, SUSPECT_CAP,
+        HTTP_SUCCESS_BURST_SCORE, MIN_AUTO_BLOCK_EVENTS, MIN_AUTO_BLOCK_HIGH_CONFIDENCE_EVENTS,
+        SUSPECT_CAP,
     },
     models::{AppState, AutoBlock, HttpBehaviorSnapshot, Suspect},
     network::is_blockable_ip,
@@ -272,16 +272,13 @@ fn process_suspect_signal(
         });
     }
 
-    let learning_complete =
-        now.signed_duration_since(app.start_time).num_hours() >= LEARNING_PERIOD_HOURS;
-
     let auto_block_eligible = app
         .suspects
         .iter()
         .find(|existing| existing.ip == suspect.ip)
         .is_some_and(auto_block_eligible);
 
-    if learning_complete && score >= AUTO_BLOCK_SCORE_THRESHOLD && auto_block_eligible {
+    if score >= AUTO_BLOCK_SCORE_THRESHOLD && auto_block_eligible {
         return Some(AutoBlock {
             ip: suspect.ip,
             reason: format!(
@@ -301,7 +298,6 @@ const fn auto_block_eligible(suspect: &Suspect) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, Utc};
     use std::{collections::HashSet, sync::Arc};
     use tokio::sync::Mutex;
 
@@ -320,7 +316,6 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new(
             Vec::new(),
             HashSet::new(),
-            Utc::now(),
             crate::models::RuntimeMode::Standalone,
         )));
         let line = "Jun 23 host sshd[1]: Failed password for root from 8.8.8.8 port 22 ssh2";
@@ -338,11 +333,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_auto_block_after_learning_period_and_threshold() {
+    async fn returns_auto_block_after_threshold() {
         let state = Arc::new(Mutex::new(AppState::new(
             Vec::new(),
             HashSet::new(),
-            Utc::now() - Duration::hours(13),
             crate::models::RuntimeMode::Standalone,
         )));
 
@@ -364,7 +358,6 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new(
             Vec::new(),
             HashSet::new(),
-            Utc::now() - Duration::hours(13),
             crate::models::RuntimeMode::Standalone,
         )));
 
@@ -384,7 +377,6 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new(
             Vec::new(),
             HashSet::new(),
-            Utc::now() - Duration::hours(13),
             crate::models::RuntimeMode::Standalone,
         )));
 
@@ -494,7 +486,6 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new(
             Vec::new(),
             HashSet::new(),
-            Utc::now(),
             crate::models::RuntimeMode::Standalone,
         )));
 

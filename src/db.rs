@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Pool, Row, Sqlite, sqlite::SqlitePoolOptions};
+use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::env;
 
 use crate::{constants::DB_URL, models::BlockedIp};
@@ -66,27 +66,6 @@ pub async fn init_db() -> Result<Pool<Sqlite>> {
     .await?;
 
     Ok(pool)
-}
-
-pub async fn get_start_time(pool: &Pool<Sqlite>) -> Result<DateTime<Utc>> {
-    let row = sqlx::query("SELECT value FROM system_state WHERE key = 'start_time'")
-        .fetch_optional(pool)
-        .await?;
-
-    if let Some(row) = row {
-        let ts_str: String = row.try_get(0)?;
-        if let Ok(ts) = DateTime::parse_from_rfc3339(&ts_str) {
-            return Ok(ts.with_timezone(&Utc));
-        }
-    }
-
-    let now = Utc::now();
-    sqlx::query("INSERT OR REPLACE INTO system_state (key, value) VALUES ('start_time', ?)")
-        .bind(now.to_rfc3339())
-        .execute(pool)
-        .await?;
-
-    Ok(now)
 }
 
 pub async fn load_blocked(pool: &Pool<Sqlite>) -> Result<Vec<BlockedIp>> {

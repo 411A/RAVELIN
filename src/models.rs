@@ -41,7 +41,6 @@ pub struct AppState {
     pub selected_suspect_idx: usize,
     pub selected_block_idx: usize,
     pub active_window: ActiveWindow,
-    pub start_time: DateTime<Utc>,
     pub logs_scroll: usize,
     pub suspects_scroll: usize,
     pub blocked_scroll: usize,
@@ -63,7 +62,6 @@ impl AppState {
     pub fn new(
         blocked: Vec<BlockedIp>,
         local_ips: HashSet<String>,
-        start_time: DateTime<Utc>,
         runtime_mode: RuntimeMode,
     ) -> Self {
         Self {
@@ -77,7 +75,6 @@ impl AppState {
             selected_suspect_idx: 0,
             selected_block_idx: 0,
             active_window: ActiveWindow::Suspects,
-            start_time,
             logs_scroll: 0,
             suspects_scroll: 0,
             blocked_scroll: 0,
