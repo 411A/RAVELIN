@@ -10,6 +10,8 @@ RAVELIN is a real-time Linux VPS protection TUI/backbone. It reads Suricata `eve
 
 It uses request and response metadata, including HTTP status codes, so isolated failures are not treated the same as bursty, repetitive, or IDS-confirmed attack behavior.
 
+<img width="1368" height="771" alt="RAVELIN-TUI" src="https://github.com/user-attachments/assets/b1091af7-4fba-4cbe-9e1a-6387def6307d" />
+
 ## What It Does
 
 - Processes Suricata alerts and HTTP request/response metadata from `/var/log/suricata/eve.json`.
