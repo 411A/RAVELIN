@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Hide shell scripts from GitHub language stats
+*.sh linguist-vendored
