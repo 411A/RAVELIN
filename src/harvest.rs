@@ -547,8 +547,7 @@ async fn compact_eve_json(pool: &Pool<Sqlite>) -> Result<usize> {
 
         let age_hours = timestamp
             .and_then(parse_iso_timestamp)
-            .map(|ts| (now - ts).num_hours())
-            .unwrap_or(i64::MAX);
+            .map_or(i64::MAX, |ts| (now - ts).num_hours());
 
         let keep = if is_blocked {
             age_hours < EVE_RETENTION_BLOCK_HOURS

@@ -1,5 +1,5 @@
 // SQLite database URL. Root uses /var/lib/ravelin/, non-root uses ~/.ravelin/.
-pub const DB_URL: &str = "sqlite://ravelin.db?mode=rwc";
+pub const DB_URL: &str = "sqlite:///var/lib/ravelin/ravelin.db?mode=rwc";
 
 // Max log lines shown in the LIVE FEED panel.
 pub const LOG_CAP: usize = 200;
