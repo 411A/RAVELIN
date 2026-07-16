@@ -89,6 +89,13 @@ pub const SURICATA_MAX_LINES_PER_POLL: usize = 1_000;
 // How often (seconds) to poll syslog for new entries.
 pub const SYSLOG_POLL_SECS: u64 = 5;
 
+// How often (seconds) to run the Suricata log cleanup.
+pub const SURICATA_CLEANUP_SECS: u64 = 3_600;
+// Retention: non-block logs older than this (hours) are purged from eve.json.
+pub const EVE_RETENTION_NON_BLOCK_HOURS: i64 = 48;
+// Retention: block-causing logs older than this (hours) are purged from eve.json.
+pub const EVE_RETENTION_BLOCK_HOURS: i64 = 168;
+
 // Path to Suricata's JSON event log.
 pub const SURICATA_EVE_PATH: &str = "/var/log/suricata/eve.json";
 

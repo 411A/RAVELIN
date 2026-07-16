@@ -1,9 +1,10 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use sqlx::{Pool, Sqlite};
-use std::{io::SeekFrom, path::Path, sync::Arc};
+use std::{collections::HashSet, io::SeekFrom, path::Path, sync::Arc};
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, AsyncSeekExt, BufReader},
+    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Mutex,
     sync::watch,
@@ -13,6 +14,7 @@ use tokio::{
 use crate::{
     actions,
     constants::{
+        EVE_RETENTION_BLOCK_HOURS, EVE_RETENTION_NON_BLOCK_HOURS, SURICATA_CLEANUP_SECS,
         SURICATA_EVE_PATH, SURICATA_MAX_LINES_PER_POLL, SURICATA_POLL_SECS, SYSLOG_POLL_SECS,
     },
     engine::process_log_line,
@@ -58,15 +60,20 @@ pub fn start_harvesters(
         pool.clone(),
         shutdown.clone(),
     ));
-    tokio::spawn(follow_syslog(app_state.clone(), pool, shutdown));
+    tokio::spawn(follow_syslog(
+        app_state.clone(),
+        pool.clone(),
+        shutdown.clone(),
+    ));
     {
-        let state = app_state;
+        let state = app_state.clone();
         tokio::spawn(async move {
             state.lock().await.push_log(
                 "ℹ️ [Core] all harvesters started — watching SSH, Docker, Syslog, Suricata",
             );
         });
     }
+    tokio::spawn(suricata_cleanup_task(pool, app_state, shutdown));
 }
 
 #[derive(Clone, Copy)]
@@ -473,6 +480,121 @@ async fn follow_syslog(
             return;
         }
     }
+}
+
+async fn suricata_cleanup_task(
+    pool: Pool<Sqlite>,
+    app_state: Arc<Mutex<AppState>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if sleep_or_shutdown(Duration::from_secs(SURICATA_CLEANUP_SECS), &mut shutdown).await {
+            return;
+        }
+
+        match compact_eve_json(&pool).await {
+            Ok(pruned) => {
+                if pruned > 0 {
+                    push_harvest_status(
+                        &app_state,
+                        "Cleanup",
+                        &format!("pruned {pruned} stale entries from eve.json"),
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                push_harvest_error(&app_state, "Cleanup", &error).await;
+            }
+        }
+    }
+}
+
+async fn compact_eve_json(pool: &Pool<Sqlite>) -> Result<usize> {
+    let blocked_ips = crate::db::get_blocked_ips(pool).await?;
+    let blocked_set: HashSet<String> = blocked_ips.into_iter().collect();
+
+    let meta = tokio::fs::metadata(SURICATA_EVE_PATH).await?;
+    if meta.len() == 0 {
+        return Ok(0);
+    }
+
+    let now = Utc::now();
+    let tmp_path = format!("{SURICATA_EVE_PATH}.tmp.{}", std::process::id());
+
+    let file = File::open(SURICATA_EVE_PATH).await?;
+    let reader = BufReader::new(file);
+    let mut lines_iter = reader.lines();
+    let mut tmp_file = File::create(&tmp_path).await?;
+    let mut total_lines = 0usize;
+    let mut kept_lines = 0usize;
+
+    while let Some(line_result) = lines_iter.next_line().await? {
+        total_lines += 1;
+        let trimmed = line_result.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !trimmed.contains("\"alert\"") && !trimmed.contains("\"http\"") {
+            continue;
+        }
+
+        let src_ip = extract_json_str(trimmed, "src_ip");
+        let timestamp = extract_json_str(trimmed, "timestamp");
+
+        let is_blocked = src_ip.is_some_and(|ip| blocked_set.contains(ip));
+
+        let age_hours = timestamp
+            .and_then(parse_iso_timestamp)
+            .map(|ts| (now - ts).num_hours())
+            .unwrap_or(i64::MAX);
+
+        let keep = if is_blocked {
+            age_hours < EVE_RETENTION_BLOCK_HOURS
+        } else {
+            age_hours < EVE_RETENTION_NON_BLOCK_HOURS
+        };
+
+        if keep {
+            tmp_file.write_all(line_result.as_bytes()).await?;
+            tmp_file.write_all(b"\n").await?;
+            kept_lines += 1;
+        }
+    }
+
+    tmp_file.flush().await?;
+    drop(tmp_file);
+
+    let pruned = total_lines.saturating_sub(kept_lines);
+    if pruned == 0 {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Ok(0);
+    }
+
+    tokio::fs::rename(&tmp_path, SURICATA_EVE_PATH).await?;
+
+    Ok(pruned)
+}
+
+fn extract_json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\":");
+    let start = json.find(&needle)? + needle.len();
+    let rest = json[start..].trim_start();
+
+    if rest.starts_with('"') {
+        let value_start = 1;
+        let value_end = rest[value_start..].find('"')?;
+        Some(&rest[value_start..value_start + value_end])
+    } else {
+        None
+    }
+}
+
+fn parse_iso_timestamp(ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]

@@ -96,3 +96,10 @@ pub async fn delete_blocked(pool: &Pool<Sqlite>, ip: &str) -> Result<()> {
 
     Ok(())
 }
+
+pub async fn get_blocked_ips(pool: &Pool<Sqlite>) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT ip FROM blocked_ips")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(ip,)| ip).collect())
+}
